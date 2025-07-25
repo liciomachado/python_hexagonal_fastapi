@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.infraestructure.dependencies import get_create_user_usecase
 from app.application.usecases.create_user import CreateUserUseCase
-from app.core.config import settings
+from app.core.config import Config
 
 user_router = APIRouter(prefix="/users", tags=["users"])
 
@@ -16,5 +16,5 @@ def create_user(
 
 @user_router.get("env")
 def create_user():
-    config = settings.environment
+    config = Config.ENVIRONMENT
     return config

@@ -1,29 +1,22 @@
-from pydantic_settings import BaseSettings
-from functools import lru_cache
 import os
+from dotenv import load_dotenv
+from pathlib import Path
 
-class Settings(BaseSettings):
-    database_url: str
-    environment: str = "development"
+# Detecta o ambiente: development, test, staging, production
+ENV = os.getenv("ENV", "development")
 
-    class Config:
-        env_file = ".env"  # default
+# Caminho do .env.{ENV}
+env_path = Path(".") / f".env.{ENV}"
 
-@lru_cache()
-def get_settings() -> Settings:
-    app_env = os.getenv("APP_ENV", "development").lower()
+# Carrega o arquivo correspondente
+load_dotenv(dotenv_path=env_path)
 
-    env_file_map = {
-        "test": ".env.test",
-        "staging": ".env.staging",
-        "production": ".env.production",
-        "development": ".env"
-    }
-
-    env_file = env_file_map.get(app_env, ".env")
-    return Settings(_env_file=env_file)
-
-# Use em toda aplicação como:
-settings = get_settings()
-
-print(f"✅ Loaded settings for env={settings.environment}: {settings.environment}")
+class Config:
+    # ENV = ENV
+    # DEBUG = os.getenv("DEBUG", "False").lower() in ["true", "1", "yes"]
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///:memory:")
+    ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+    # CAR_FUNCTION_API_KEY = os.getenv("CAR_FUNCTION_API_KEY", "")
+    # RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+    # RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
+    # RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
