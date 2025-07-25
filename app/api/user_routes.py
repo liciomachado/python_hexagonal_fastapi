@@ -1,21 +1,20 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from app.core.db import SessionLocal
-from app.infraestructure.repository.user_repository import UserRepository
+from app.infraestructure.dependencies import get_create_user_usecase
 from app.application.usecases.create_user import CreateUserUseCase
+from app.core.config import settings
 
 user_router = APIRouter(prefix="/users", tags=["users"])
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 @user_router.post("")
-def create_user(name: str, email: str, db: Session = Depends(get_db)):
-    repo = UserRepository(db)
-    usecase = CreateUserUseCase(repo)
+def create_user(
+    name: str,
+    email: str,
+    usecase: CreateUserUseCase = Depends(get_create_user_usecase)
+):
     user = usecase.execute(name=name, email=email)
     return user
+
+@user_router.get("env")
+def create_user():
+    config = settings.environment
+    return config
