@@ -1,5 +1,5 @@
-# app/core/dependencies.py
-
+from collections.abc import AsyncGenerator
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
@@ -9,13 +9,10 @@ from app.infraestructure.repository.api_key_repository import ApiKeyRepository
 from app.infraestructure.repository.user_repository import UserRepository
 from app.application.usecases.create_user import CreateUserUseCase
 
-# Dependência de sessão com banco
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocal() as session:
+        yield session
 
 # Injeta o repositório com o banco
 def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
@@ -29,11 +26,11 @@ def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
     repo = ApiKeyRepository(db)
     return ValidateApiKeyUseCase(repo)
 
-def validate_api_key(
+async def validate_api_key(
     x_api_key: str = Header(..., alias="x-api-key"),
     usecase: ValidateApiKeyUseCase = Depends(get_api_key_usecase)
 ):
-    client = usecase.execute(x_api_key)
+    client = await usecase.execute(x_api_key)
     if client.is_err():
         error = client.error()
         if error is UnauthorizedError:

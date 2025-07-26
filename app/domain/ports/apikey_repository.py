@@ -5,9 +5,9 @@ from app.domain.entities.user import User
 class ApiKeyRepositoryPort(ABC):
     
     @abstractmethod
-    def get_active_client_by_key(self, api_key: str) -> ApiClient | None:
+    async def get_active_client_by_key(self, api_key: str) -> ApiClient | None:
         pass
 
     @abstractmethod
-    def debit_credit(self, client: ApiClient):
+    async def debit_credit(self, client: ApiClient):
         pass

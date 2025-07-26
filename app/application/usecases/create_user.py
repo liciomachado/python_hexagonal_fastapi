@@ -15,7 +15,7 @@ class CreateUserUseCase:
     def __init__(self, repo: UserRepositoryPort):
         self.repo = repo
 
-    def execute(self, request: CreateUserRequest) -> CreateUserResponse:
+    async def execute(self, request: CreateUserRequest) -> CreateUserResponse:
         new_user = User(id=None, name=request.name, email=request.email)
-        self.repo.create_user(new_user)
+        await self.repo.create_user(new_user)
         return CreateUserResponse(id=new_user.id, name=new_user.name, email=new_user.email)
