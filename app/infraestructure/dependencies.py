@@ -3,6 +3,7 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, HTTPException, Header, Security
 from sqlalchemy.orm import Session
+from app.application.usecases.get_images_by_range import GetImagesByRangeUseCase
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
 from app.core.utils.result import UnauthorizedError
@@ -27,6 +28,8 @@ def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
     repo = ApiKeyRepository(db)
     return ValidateApiKeyUseCase(repo)
 
+def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
+    return GetImagesByRangeUseCase()
 
 API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)

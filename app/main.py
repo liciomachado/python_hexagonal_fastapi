@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from app.api.user_routes import user_router
+from app.api.sentinel_routes import sentinel_router
 
 app = FastAPI(title="Hexagonal FastAPI Example")
 
 app.include_router(user_router, prefix="/api")
+app.include_router(sentinel_router, prefix="/api")
 
 
 #execute a applicação com o comando: 'uvicorn app.main:app --reload'  na raiz do projeto
