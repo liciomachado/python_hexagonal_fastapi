@@ -1,8 +1,10 @@
 # app/core/dependencies.py
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, Header
 from sqlalchemy.orm import Session
+from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
+from app.infraestructure.repository.api_key_repository import ApiKeyRepository
 from app.infraestructure.repository.user_repository import UserRepository
 from app.application.usecases.create_user import CreateUserUseCase
 
@@ -21,3 +23,19 @@ def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
 # Injeta o caso de uso com o repositório
 def get_create_user_usecase(repo: UserRepository = Depends(get_user_repository)) -> CreateUserUseCase:
     return CreateUserUseCase(repo)
+
+def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
+    repo = ApiKeyRepository(db)
+    return ValidateApiKeyUseCase(repo)
+
+def validate_api_key(
+    x_api_key: str = Header(..., alias="x-api-key"),
+    usecase: ValidateApiKeyUseCase = Depends(get_api_key_usecase)
+):
+    try:
+        client = usecase.execute(x_api_key)
+        return client
+    except Exception as e:
+        detail = str(e)
+        status_code = 401 if "inválida" in detail else 403
+        raise HTTPException(status_code=status_code, detail=detail)
