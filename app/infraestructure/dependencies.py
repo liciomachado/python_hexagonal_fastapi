@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
+from app.core.utils.result import UnauthorizedError
 from app.infraestructure.repository.api_key_repository import ApiKeyRepository
 from app.infraestructure.repository.user_repository import UserRepository
 from app.application.usecases.create_user import CreateUserUseCase
@@ -32,10 +33,11 @@ def validate_api_key(
     x_api_key: str = Header(..., alias="x-api-key"),
     usecase: ValidateApiKeyUseCase = Depends(get_api_key_usecase)
 ):
-    try:
-        client = usecase.execute(x_api_key)
-        return client
-    except Exception as e:
-        detail = str(e)
-        status_code = 401 if "inválida" in detail else 403
-        raise HTTPException(status_code=status_code, detail=detail)
+    client = usecase.execute(x_api_key)
+    if client.is_err():
+        error = client.error()
+        if error is UnauthorizedError:
+            raise HTTPException(status_code=401, detail=str(error))
+        raise HTTPException(status_code=403, detail=str(error))
+    return client.value() 
+   
