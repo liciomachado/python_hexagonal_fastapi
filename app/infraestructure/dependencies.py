@@ -1,6 +1,7 @@
 from collections.abc import AsyncGenerator
+from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import Depends, HTTPException, Header
+from fastapi import Depends, HTTPException, Header, Security
 from sqlalchemy.orm import Session
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
@@ -26,8 +27,12 @@ def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
     repo = ApiKeyRepository(db)
     return ValidateApiKeyUseCase(repo)
 
+
+API_KEY_NAME = "x-api-key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
 async def validate_api_key(
-    x_api_key: str = Header(..., alias="x-api-key"),
+    x_api_key: str = Security(api_key_header),
     usecase: ValidateApiKeyUseCase = Depends(get_api_key_usecase)
 ):
     client = await usecase.execute(x_api_key)
