@@ -3,7 +3,10 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, HTTPException, Header, Security
 from sqlalchemy.orm import Session
+from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeService
+from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageService
 from app.application.usecases.get_images_by_range import GetImagesByRangeUseCase
+from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayUseCase
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
 from app.core.utils.result import UnauthorizedError
@@ -29,7 +32,12 @@ def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
     return ValidateApiKeyUseCase(repo)
 
 def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
-    return GetImagesByRangeUseCase()
+    planetary_image_service = PlanetaryGetOptionImagesByRangeService()
+    return GetImagesByRangeUseCase(planetary_image_service)
+
+def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:
+    planetary_visual_image_service = PlanetaryVisualImageService()
+    return GetVisualImageByDayUseCase(planetary_visual_image_service)
 
 API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
