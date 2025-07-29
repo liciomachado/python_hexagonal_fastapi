@@ -41,11 +41,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             width = maxx - minx
             height = maxy - miny
             size = max(width, height)
-            center_x = (minx + maxx) / 2
-            center_y = (miny + maxy) / 2
-            square_geom = box(center_x - size / 2, center_y - size / 2, center_x + size / 2, center_y + size / 2)
+            square_parameter = 2
+            center_x = (minx + maxx) / square_parameter
+            center_y = (miny + maxy) / square_parameter
+            square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
             geojson_geom = mapping(square_geom)
-            buffer = 0.003  # graus
+            buffer = 0.0015  # graus
             geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
             minx, miny, maxx, maxy = square_geom.bounds
 
@@ -68,6 +69,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
             selected = None
             for item in items:
+                if item.geometry is None:
+                    continue
                 image_geom = shape(item.geometry)
                 if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
                     selected = item
@@ -94,30 +97,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
-    
-    async def _download_crop_image(self, signed_url: str, geom_bounds: tuple):
-        with rasterio.Env():
-            with rasterio.open(signed_url) as src:
-                geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
-                window = from_bounds(*geom_bounds_proj, transform=src.transform)
-                window = window.round_offsets().round_lengths()
-
-                # Lê a janela com precisão (ex: Sentinel geralmente em uint16)
-                image = src.read(window=window)
-
-                # Normaliza cada banda para uint8 (0-255)
-                def normalize(band):
-                    return ((band - band.min()) / (band.max() - band.min()) * 255).astype(np.uint8)
-
-                image = self.normalize_image_stack(image)
-
-                # Reordena e aumenta resolução
-                image = np.moveaxis(image, 0, -1)
-                scale_factor = 4
-                new_size = (image.shape[1] * scale_factor, image.shape[0] * scale_factor)
-                pil_img = Image.fromarray(image).resize(new_size, Image.Resampling.LANCZOS)
-
-                return self.pil_image_to_base64(pil_img)
             
     def normalize_image_stack(self, image):
         p2 = np.percentile(image, 2)
@@ -125,10 +104,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         image = np.clip(image, p2, p98)
         return ((image - p2) / (p98 - p2) * 255).astype(np.uint8)
 
-
     async def _download_crop_rgb_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
-        from PIL import ImageEnhance, ImageFilter
-
+        from PIL import ImageFilter
 
         bands_data = []
         transform_affine = None
@@ -157,15 +134,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     bands_data.append(band)
 
         image_rgb = np.stack(bands_data, axis=-1)
-
         pil_img = Image.fromarray(image_rgb)
-
-
-        # 2. (Removido ajuste de contraste, brilho e desaturação para manter cor original)
 
         # 3. (Opcional: Sharpening pode ser mantido ou removido, aqui mantido para leve nitidez)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
-
 
         # --- Desenhar polígono amarelo (agora em método separado e suavizado) ---
         return self.draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="yellow", width=1)
@@ -205,8 +177,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         return self.pil_image_to_base64(pil_img)
     
-
-        
     def _normalize_image_to_uint8(self, image: np.ndarray) -> np.ndarray:
         """
         Normaliza array de imagem de 16 bits (Sentinel-2) para 8 bits.
