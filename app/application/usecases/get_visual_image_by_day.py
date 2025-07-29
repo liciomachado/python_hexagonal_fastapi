@@ -1,14 +1,15 @@
 from pydantic import BaseModel
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageServicePort
 from app.core.utils.result import AppError, Result
+from datetime import date
 
 class GetVisualImageByDayRequest(BaseModel):
-    day: str
+    day: date
     cloud_percentual: float
     geometry: str
 
 class GetVisualImageByDayResponse(BaseModel):
-    #day: str
+    day: date
     cloud_percentual: float
     base64image: str
 
@@ -22,8 +23,11 @@ class GetVisualImageByDayUseCase:
             cloud_percentual=request.cloud_percentual,
             geometry=request.geometry
         )
+        if response.is_err():
+            return Result.Err(response.error)
+        response = response.value()
         return Result.Ok(GetVisualImageByDayResponse(
-            #day=response.day,
+            day=response.day,
             cloud_percentual=response.cloud_percentual,
             base64image=response.base64image
         ))

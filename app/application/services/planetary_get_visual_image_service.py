@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-import datetime
+from datetime import date
 import base64
 from io import BytesIO
 from PIL import Image
@@ -12,20 +12,17 @@ from rasterio.session import AWSSession
 from rasterio.io import MemoryFile
 from urllib.parse import quote
 
+from app.core.utils.result import AppError, Result
+
 class PlanetaryVisualImageServicePort(ABC):
     @abstractmethod
-    async def get_visual_image(
-        self,
-        day: datetime.date,
-        cloud_percentual: float,
-        geometry: str
-    ) -> PlanetaryImageVisualResponse:
+    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
         pass
 
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     BASE_URL = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 
-    async def get_visual_image(self, day: datetime.datetime, cloud_percentual: float, geometry: str) -> PlanetaryImageVisualResponse:
+    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
         geom = wkt.loads(geometry)
         bounds = geom.bounds
         minx, miny, maxx, maxy = bounds
@@ -39,12 +36,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # Cria bounding box quadrada ao redor do centro
         square_geom = box(center_x - size/2, center_y - size/2, center_x + size/2, center_y + size/2)
         geojson_geom = mapping(square_geom)
-
-        # Garante que 'day' seja um objeto datetime.date ou datetime.datetime
-        if isinstance(day, str):
-            day = datetime.datetime.fromisoformat(day).date()
-        elif isinstance(day, datetime.datetime):
-            day = day.date()
 
         # Busca imagens do dia
         payload = {
@@ -72,7 +63,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 break
 
         if not selected:
-            raise ValueError(f"Nenhuma imagem cobre ao menos {percentual_cloud * 100}% da geometria.")
+            return Result.Err(f"Nenhuma imagem cobre ao menos {percentual_cloud * 100}% da geometria.")
 
         asset_url = selected["assets"]["visual"]["href"]
         signed_url = await self.get_signed_url_if_needed(asset_url)
@@ -92,12 +83,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 pil_img.save(buffered, format="JPEG")
                 base64_img = base64.b64encode(buffered.getvalue()).decode()
 
-        return PlanetaryImageVisualResponse(
+        return Result.Ok(PlanetaryImageVisualResponse(
             day=day,
             cloud_percentual=selected["properties"].get("eo:cloud_cover", 0.0),
             base64image=base64_img
-        )
-    
+        ))
+
     async def get_signed_url_if_needed(self, asset_url: str) -> str:
         # Se a URL já tem SAS token (verificamos por "sig="), não precisa assinar
         if "sig=" in asset_url:
