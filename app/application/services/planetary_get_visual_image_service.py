@@ -101,15 +101,21 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 def normalize(band):
                     return ((band - band.min()) / (band.max() - band.min()) * 255).astype(np.uint8)
 
-                image = np.array([normalize(b) for b in image])
+                image = self.normalize_image_stack(image)
 
                 # Reordena e aumenta resolução
                 image = np.moveaxis(image, 0, -1)
-                scale_factor = 2
+                scale_factor = 4
                 new_size = (image.shape[1] * scale_factor, image.shape[0] * scale_factor)
                 pil_img = Image.fromarray(image).resize(new_size, Image.Resampling.LANCZOS)
 
                 return self.pil_image_to_base64(pil_img)
+            
+    def normalize_image_stack(self, image):
+        p2 = np.percentile(image, 2)
+        p98 = np.percentile(image, 98)
+        image = np.clip(image, p2, p98)
+        return ((image - p2) / (p98 - p2) * 255).astype(np.uint8)
 
     def pil_image_to_base64(self, pil_img: Image.Image, format: str = "JPEG") -> str:
         buffered = BytesIO()
