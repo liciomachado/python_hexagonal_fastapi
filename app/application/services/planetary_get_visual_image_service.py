@@ -1,104 +1,119 @@
 from abc import ABC, abstractmethod
 from datetime import date
-import base64
 from io import BytesIO
+import base64
 from PIL import Image
 from shapely import wkt
 from shapely.geometry import mapping, box, shape
-import httpx
-from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
-import rasterio
-from rasterio.session import AWSSession
 from rasterio.io import MemoryFile
-from urllib.parse import quote
+from rasterio.windows import from_bounds
+from rasterio.warp import transform_bounds
+import numpy as np
+import httpx
 
-from app.core.utils.result import AppError, Result
+from pystac_client import Client
+from planetary_computer import sign
+import rasterio
+
+from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
+from app.core.utils.result import AppError, BadRequestError, Result
+
 
 class PlanetaryVisualImageServicePort(ABC):
     @abstractmethod
     async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
         pass
 
+
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
-    BASE_URL = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
+    STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
     async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
-        geom = wkt.loads(geometry)
-        bounds = geom.bounds
-        minx, miny, maxx, maxy = bounds
-        width = maxx - minx
-        height = maxy - miny
-        size = max(width, height)
-        center_x = (minx + maxx) / 2
-        center_y = (miny + maxy) / 2
-        percentual_cloud = cloud_percentual / 100.0
+        try:
+            geom = wkt.loads(geometry)
+            bounds = geom.bounds
+            minx, miny, maxx, maxy = bounds
+            width = maxx - minx
+            height = maxy - miny
+            size = max(width, height)
+            center_x = (minx + maxx) / 2
+            center_y = (miny + maxy) / 2
+            square_geom = box(center_x - size / 2, center_y - size / 2, center_x + size / 2, center_y + size / 2)
+            geojson_geom = mapping(square_geom)
+            minx, miny, maxx, maxy = square_geom.bounds
 
-        # Cria bounding box quadrada ao redor do centro
-        square_geom = box(center_x - size/2, center_y - size/2, center_x + size/2, center_y + size/2)
-        geojson_geom = mapping(square_geom)
+            # Conecta ao STAC com pystac-client
+            catalog = Client.open(self.STAC_URL)
 
-        # Busca imagens do dia
-        payload = {
-            "collections": ["sentinel-2-l2a"],
-            "intersects": geojson_geom,
-            "datetime": f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-            "limit": 10
-        }
+            search = catalog.search(
+                collections=["sentinel-2-l2a"],
+                intersects=geojson_geom,
+                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
+                max_items=10
+            )
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(self.BASE_URL, json=payload)
-            response.raise_for_status()
-            features = response.json().get("features", [])
+            items = list(search.get_items())
+            if not items:
+                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
 
-        if not features:
-            raise ValueError("Nenhuma imagem encontrada para a data e geometria fornecidas.")
+            # Ordena por menor cobertura de nuvem
+            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
 
-        # Seleciona a imagem com menor nuvem e maior interseção
-        selected = None
-        coverage_threshold = percentual_cloud 
-        for feature in sorted(features, key=lambda f: f["properties"].get("eo:cloud_cover", 100)):
-            image_geom = shape(feature["geometry"])
-            if geom.intersection(image_geom).area / geom.area >= coverage_threshold:
-                selected = feature
-                break
+            selected = None
+            for item in items:
+                image_geom = shape(item.geometry)
+                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
+                    selected = item
+                    break
 
-        if not selected:
-            return Result.Err(f"Nenhuma imagem cobre ao menos {percentual_cloud * 100}% da geometria.")
+            if not selected:
+                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
 
-        asset_url = selected["assets"]["visual"]["href"]
-        signed_url = await self.get_signed_url_if_needed(asset_url)
+            visual_asset = selected.assets.get("visual")
+            if not visual_asset:
+                return Result.Err(BadRequestError("Imagem visual não disponível."))
 
-        # Abre imagem com rasterio + memoryfile
-        async with httpx.AsyncClient(timeout=60) as client:
-            img_response = await client.get(signed_url)
-            img_response.raise_for_status()
-            img_bytes = img_response.content
+            signed_url = sign(visual_asset.href)
 
-        with MemoryFile(img_bytes) as memfile:
-            with memfile.open() as dataset:
-                img = dataset.read([1, 2, 3])  # RGB
-                img = img.transpose(1, 2, 0)   # CxHxW → HxWxC
-                pil_img = Image.fromarray(img.astype('uint8'))
-                buffered = BytesIO()
-                pil_img.save(buffered, format="JPEG")
-                base64_img = base64.b64encode(buffered.getvalue()).decode()
+            # Tenta abrir com rasterio
+            image = await self._download_crop_image(signed_url, (minx, miny, maxx, maxy))
 
-        return Result.Ok(PlanetaryImageVisualResponse(
-            day=day,
-            cloud_percentual=selected["properties"].get("eo:cloud_cover", 0.0),
-            base64image=base64_img
-        ))
+            return Result.Ok(PlanetaryImageVisualResponse(
+                day=day,
+                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                base64image=image
+            ))
 
-    async def get_signed_url_if_needed(self, asset_url: str) -> str:
-        # Se a URL já tem SAS token (verificamos por "sig="), não precisa assinar
-        if "sig=" in asset_url:
-            return asset_url
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
+    
+    async def _download_crop_image(self, signed_url: str, geom_bounds: tuple):
+        with rasterio.Env():
+            with rasterio.open(signed_url) as src:
+                geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
+                window = from_bounds(*geom_bounds_proj, transform=src.transform)
+                window = window.round_offsets().round_lengths()
 
-        # Caso contrário, assina via Planetary Computer
-        encoded_url = quote(asset_url, safe='')
-        sign_url = f"https://planetarycomputer.microsoft.com/api/sas/v1/sign?href={encoded_url}"
-        async with httpx.AsyncClient(timeout=30) as client:
-            sign_response = await client.get(sign_url)
-            sign_response.raise_for_status()
-            signed_url = sign_response.json()["href"]
-            return signed_url
+                # Lê a janela com precisão (ex: Sentinel geralmente em uint16)
+                image = src.read(window=window)
+
+                # Normaliza cada banda para uint8 (0-255)
+                def normalize(band):
+                    return ((band - band.min()) / (band.max() - band.min()) * 255).astype(np.uint8)
+
+                image = np.array([normalize(b) for b in image])
+
+                # Reordena e aumenta resolução
+                image = np.moveaxis(image, 0, -1)
+                scale_factor = 2
+                new_size = (image.shape[1] * scale_factor, image.shape[0] * scale_factor)
+                pil_img = Image.fromarray(image).resize(new_size, Image.Resampling.LANCZOS)
+
+                return self.pil_image_to_base64(pil_img)
+
+    def pil_image_to_base64(self, pil_img: Image.Image, format: str = "JPEG") -> str:
+        buffered = BytesIO()
+        pil_img.save(buffered, format=format)
+        img_bytes = buffered.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+        return img_base64
