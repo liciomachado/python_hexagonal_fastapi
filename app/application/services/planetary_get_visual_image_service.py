@@ -45,7 +45,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             center_y = (miny + maxy) / 2
             square_geom = box(center_x - size / 2, center_y - size / 2, center_x + size / 2, center_y + size / 2)
             geojson_geom = mapping(square_geom)
-            buffer = 0.004  # graus
+            buffer = 0.003  # graus
             geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
             minx, miny, maxx, maxy = square_geom.bounds
 
@@ -59,7 +59,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 max_items=10
             )
 
-            items = list(search.get_items())
+            items = list(search.items())
             if not items:
                 return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
 
@@ -125,58 +125,83 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         image = np.clip(image, p2, p98)
         return ((image - p2) / (p98 - p2) * 255).astype(np.uint8)
 
+
     async def _download_crop_rgb_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
+        from PIL import ImageEnhance, ImageFilter
+
+
         bands_data = []
         transform_affine = None
         image_crs = None
+        window = None
 
-        for band_name in ["red", "green", "blue"]:
+        # 1. Leitura das bandas e conversão direta para uint8 mantendo cor original
+        for band_idx, band_name in enumerate(["red", "green", "blue"]):
             band_asset_key = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
             href = band_hrefs[band_asset_key]
             href = sign(href)
 
             with rasterio.Env():
                 with rasterio.open(href) as src:
-                    if transform_affine is None:
+                    if band_idx == 0:
                         image_crs = src.crs
                         transform_affine = src.transform
-
-                    geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
-
-                    window = from_bounds(*geom_bounds_proj, transform=src.transform)
-                    window = window.round_offsets().round_lengths()
+                        geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
+                        window = from_bounds(*geom_bounds_proj, transform=src.transform)
+                        window = window.round_offsets().round_lengths()
 
                     band = src.read(1, window=window, boundless=True)
+                    # Conversão direta para uint8 usando divisor fixo (ex: 3000)
+                    band = np.clip(band, 0, 3000)
+                    band = (band / 3000 * 255).astype(np.uint8)
                     bands_data.append(band)
 
         image_rgb = np.stack(bands_data, axis=-1)
-        image_rgb = np.clip(image_rgb / np.max(image_rgb) * 255, 0, 255).astype(np.uint8)
 
         pil_img = Image.fromarray(image_rgb)
 
-        # --- Desenhar polígono branco ---
-        draw = ImageDraw.Draw(pil_img)
 
+        # 2. (Removido ajuste de contraste, brilho e desaturação para manter cor original)
+
+        # 3. (Opcional: Sharpening pode ser mantido ou removido, aqui mantido para leve nitidez)
+        pil_img = pil_img.filter(ImageFilter.SHARPEN)
+
+
+        # --- Desenhar polígono amarelo (agora em método separado e suavizado) ---
+        return self.draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="yellow", width=1)
+
+    def draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="yellow", width=2, interp_points=500):
+        """
+        Desenha um polígono suavizado (interpolado) sobre a imagem PIL.
+        interp_points: número de pontos interpolados para suavizar a linha.
+        """
+        from shapely.geometry import LineString
+        draw = ImageDraw.Draw(pil_img)
         # Transforma geom para o CRS da imagem
         project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
         geom_proj = shapely_transform(project, geom)
 
-        # Transforma coordenadas geográficas em coordenadas de pixel (col, row)
-        def world_to_pixel(x, y):
+        def world_to_pixel(x, y, transform_affine, window):
             col, row = ~transform_affine * (x, y)
-            # Ajusta para o deslocamento da janela
             return (col - window.col_off, row - window.row_off)
 
+        coords = list(mapping(geom_proj)["coordinates"][0])
+        # Interpolação para suavizar a linha
+        line = LineString(coords)
+        if len(coords) < interp_points:
+            interp_points = max(len(coords)*3, 50)
+        interp_line = [line.interpolate(float(i)/interp_points, normalized=True).coords[0] for i in range(interp_points)]
         pixel_coords = []
-        for coord in mapping(geom_proj)["coordinates"][0]:
-            px, py = world_to_pixel(*coord)
+        for coord in interp_line:
+            x, y = coord[:2]
+            px, py = world_to_pixel(x, y, transform_affine, window)
             pixel_coords.append((px, py))
+        # Fecha o polígono
+        pixel_coords.append(pixel_coords[0])
+        draw.line(pixel_coords, fill=color, width=width, joint="curve")
 
-        # Desenha o contorno branco
-        draw.line(pixel_coords + [pixel_coords[0]], fill="white", width=2)
-
-        # Opcional: aumentar resolução
-        pil_img = pil_img.resize((pil_img.width * 2, pil_img.height * 2), Image.Resampling.BICUBIC)
+        # 4. Aumentar resolução (fator 3, filtro LANCZOS)
+        pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.LANCZOS)
 
         return self.pil_image_to_base64(pil_img)
     
