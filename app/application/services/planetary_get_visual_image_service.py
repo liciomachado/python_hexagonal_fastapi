@@ -156,11 +156,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
 
-    def _get_ndvi_assets(self, item: pystac.Item) -> dict:
-        return {
-            "B04": item.assets["B04"].href,  # Red
-            "B08": item.assets["B08"].href   # NIR
-        }
+   
 
     async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry):
         from PIL import ImageFilter, Image
@@ -222,7 +218,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # Não precisa mais aumentar resolução aqui
         return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
         
-
     async def _download_crop_rgb_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
         from PIL import ImageFilter
 
@@ -307,15 +302,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         draw.line(pixel_coords, fill=color, width=width, joint="curve")
 
         return self._pil_image_to_base64(pil_img)
-    
-    def _normalize_image_to_uint8(self, image: np.ndarray) -> np.ndarray:
-        """
-        Normaliza array de imagem de 16 bits (Sentinel-2) para 8 bits.
-        """
-        image = image.astype(np.float32)
-        image = np.clip(image, 0, 3000)  # Faixa comum para Sentinel-2
-        image = (image / 3000) * 255
-        return image.astype(np.uint8)
 
     def _pil_image_to_base64(self, pil_img: Image.Image) -> str:
         """
@@ -336,6 +322,11 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             "B02": item.assets["B02"].href
         }
     
+    def _get_ndvi_assets(self, item: pystac.Item) -> dict:
+        return {
+            "B04": item.assets["B04"].href,  # Red
+            "B08": item.assets["B08"].href   # NIR
+        }
 
 # NDVI colormap
 NDVI_BANDWIDTH_COLORS_VALUES = [
