@@ -166,6 +166,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         window = None
         upscale_factor = 3  # Fator de aumento de resolução real
         # Leitura das bandas Red e NIR em alta resolução
+        crop_transform = None
         for band_idx, band_name in enumerate(["red", "nir"]):
             band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
             href = band_hrefs[band_asset_key]
@@ -180,6 +181,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         window = window.round_offsets().round_lengths()
                         out_height = int(window.height * upscale_factor)
                         out_width = int(window.width * upscale_factor)
+                        # Transform do crop já ampliado
+                        crop_transform = src.window_transform(window)
+                        # Ajustar o transform para o upscale
+                        crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
                     band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
                     bands_data.append(band)
         red = bands_data[0]
@@ -188,13 +193,20 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         ndvi = (nir - red) / (nir + red + 1e-6)
         ndvi = np.clip(ndvi, -1, 1)
 
-        #realizando cálculo do NDVI para a área de interesse
-        ndvi_area_pixels = calc_ndvi(nir, red)
-        rouded_pixels = np.round(ndvi_area_pixels, 3)
-        valid_pixels = rouded_pixels[~np.isnan(rouded_pixels) & ~np.isinf(rouded_pixels)]
-        ndvi_mean = float(np.mean(valid_pixels))
-        ndvi_min = float(np.min(valid_pixels))
-        ndvi_max = float(np.max(valid_pixels))
+        # Calcular estatísticas apenas dentro do polígono original (geom)
+        from rasterio.features import geometry_mask
+        # Polígono no CRS da imagem
+        project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
+        geom_proj = shapely_transform(project, geom)
+        mask = geometry_mask([mapping(geom_proj)], out_shape=ndvi.shape, transform=crop_transform, invert=True)
+        ndvi_inside = ndvi[mask]
+        ndvi_inside = ndvi_inside[~np.isnan(ndvi_inside) & ~np.isinf(ndvi_inside)]
+        if ndvi_inside.size > 0:
+            ndvi_mean = float(np.mean(ndvi_inside))
+            ndvi_min = float(np.min(ndvi_inside))
+            ndvi_max = float(np.max(ndvi_inside))
+        else:
+            ndvi_mean = ndvi_min = ndvi_max = None
 
         # Aplicar colormap NDVI customizado
         ndvi_rgb = np.zeros(ndvi.shape + (3,), dtype=np.float32)
