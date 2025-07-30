@@ -48,7 +48,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             center_y = (miny + maxy) / square_parameter
             square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
             geojson_geom = mapping(square_geom)
-            buffer = 0.0015  # graus
+            buffer = 0.003  # graus
             geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
             minx, miny, maxx, maxy = square_geom.bounds
 
@@ -261,8 +261,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # 3. (Opcional: Sharpening pode ser mantido ou removido, aqui mantido para leve nitidez)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
 
-        # --- Desenhar polígono amarelo (agora em método separado e suavizado) ---
-        return self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=1)
+        # Desenhar polígono já na imagem ampliada, sem resize adicional (width=5 para melhor visualização)
+        return self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
 
     def _draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="white", width=5, interp_points=200):
         """
