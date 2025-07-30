@@ -140,11 +140,16 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_ndvi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
-            image = await self._download_crop_ndvi_image(assets, geom_bounds, geom)
+            # Gera NDVI e retorna imagem + média, min e max
+            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom)
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
-                base64image=image
+                base64image=image,
+                ndvi_mean=ndvi_mean,
+                ndvi_min=ndvi_min,
+                ndvi_max=ndvi_max,
+                sat_image_id=selected.id
             ))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
@@ -155,7 +160,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             "B08": item.assets["B08"].href   # NIR
         }
 
-    async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
+    async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry):
         from PIL import ImageFilter, Image
         bands_data = []
         transform_affine = None
@@ -183,6 +188,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         ndvi = (nir - red) / (nir + red + 1e-6)
         ndvi = np.clip(ndvi, -1, 1)
 
+        #realizando cálculo do NDVI para a área de interesse
+        ndvi_area_pixels = calc_ndvi(nir, red)
+        rouded_pixels = np.round(ndvi_area_pixels, 3)
+        valid_pixels = rouded_pixels[~np.isnan(rouded_pixels) & ~np.isinf(rouded_pixels)]
+        ndvi_mean = float(np.mean(valid_pixels))
+        ndvi_min = float(np.min(valid_pixels))
+        ndvi_max = float(np.max(valid_pixels))
+
         # Aplicar colormap NDVI customizado
         ndvi_rgb = np.zeros(ndvi.shape + (3,), dtype=np.float32)
         for i in range(len(NDVI_BANDWIDTH_COLORS_VALUES) - 1):
@@ -204,8 +217,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=2)
         # Aumentar resolução
         pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.LANCZOS)
-        return self._pil_image_to_base64(pil_img)
-
+        return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
+        
 
     async def _download_crop_rgb_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
         from PIL import ImageFilter
@@ -332,3 +345,55 @@ BANDWIDTH_COLORS_NDVI = [
     (43 / 255, 186 / 255, 64 / 255),
     (28 / 255, 120 / 255, 40 / 255),
 ]
+ZERO_DIVISOR_FIX = np.iinfo(np.uint16).max * 2
+
+def apply_filters(index: np.ndarray) -> np.ndarray:
+    """
+    Apply filters to a NumPy array by modifying its values based on specific conditions.
+
+    Parameters:
+    -----------
+    index : ndarray
+        A NumPy array containing the data to be filtered.
+
+    Returns:
+    --------
+    ndarray
+        The filtered NumPy array with the following transformations:
+    """
+    index[index > 1] = 1.0
+    index[index < -1] = -1.0
+    index[index == 0] = np.nan
+    return index
+
+def calc_ndvi(b_nir: np.ndarray, b_red: np.ndarray) -> np.ndarray | list:
+    """
+    Calculate the Normalized Difference Vegetation Index (NDVI) for arrays of reflectance values.
+
+    NDVI is a measure of vegetation health and density. It is calculated using the formula:
+    NDVI = (NIR - RED) / (NIR + RED)
+
+    Parameters:
+    b_nir (np.ndarray): An array of reflectance values in the near-infrared band.
+    b_red (np.ndarray): An array of reflectance values in the red band.
+
+    Returns:
+    np.ndarray: An array of NDVI values, which range from -1 to 1.
+                - Negative values generally indicate non-vegetated surfaces (e.g., water, barren land).
+                - Values around 0 suggest sparse or no vegetation.
+                - Positive values closer to 1 indicate healthy, dense vegetation.
+                - np.nan is being used to hide 0 values as a mask
+    """
+    if len(b_nir) == 0 or len(b_red) == 0:
+        return []
+
+    b_nir = b_nir.astype(float)
+    b_red = b_red.astype(float)
+
+    denominator = b_nir + b_red
+    denominator[denominator == 0] = ZERO_DIVISOR_FIX
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndvi = np.where(denominator != 0, (b_nir - b_red) / denominator, 0)
+
+    return apply_filters(ndvi)

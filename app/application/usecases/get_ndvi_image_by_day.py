@@ -16,6 +16,10 @@ class GetNdviImageByDayResponse(BaseModel):
     day: date
     cloud_percentual: float
     base64image: str
+    ndvi_mean: float | None
+    ndvi_min: float | None
+    ndvi_max: float | None
+    sat_image_id: str
 
 class GetNdviImageByDayUseCase:
     def __init__(self, planetary_visual_image_service: PlanetaryVisualImageServicePort):
@@ -34,5 +38,9 @@ class GetNdviImageByDayUseCase:
         return Result.Ok(GetNdviImageByDayResponse(
             day=response.day,
             cloud_percentual=response.cloud_percentual,
-            base64image=response.base64image
+            base64image=response.base64image,
+            ndvi_mean=response.ndvi_mean,
+            ndvi_min=response.ndvi_min,
+            ndvi_max=response.ndvi_max,
+            sat_image_id=response.sat_image_id
         ))
