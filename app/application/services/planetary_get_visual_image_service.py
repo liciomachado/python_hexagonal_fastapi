@@ -15,6 +15,8 @@ from pystac_client import Client
 from planetary_computer import sign
 import rasterio
 
+from rasterio.enums import Resampling
+
 from app.application.services.dtos.planetary_nvdi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
 from app.core.utils.result import AppError, BadRequestError, Result
@@ -166,8 +168,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         transform_affine = None
         image_crs = None
         window = None
-        
-        # Leitura das bandas Red e NIR
+        upscale_factor = 3  # Fator de aumento de resolução real
+        # Leitura das bandas Red e NIR em alta resolução
         for band_idx, band_name in enumerate(["red", "nir"]):
             band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
             href = band_hrefs[band_asset_key]
@@ -180,7 +182,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
                         window = from_bounds(*geom_bounds_proj, transform=src.transform)
                         window = window.round_offsets().round_lengths()
-                    band = src.read(1, window=window, boundless=True).astype(np.float32)
+                        out_height = int(window.height * upscale_factor)
+                        out_width = int(window.width * upscale_factor)
+                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
                     bands_data.append(band)
         red = bands_data[0]
         nir = bands_data[1]
@@ -214,9 +218,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # Sharpen opcional
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
         # Desenhar polígono
-        self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=2)
-        # Aumentar resolução
-        pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.LANCZOS)
+        self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
+        # Não precisa mais aumentar resolução aqui
         return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
         
 
@@ -227,8 +230,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         transform_affine = None
         image_crs = None
         window = None
+        upscale_factor = 3  # Fator de aumento de resolução real
 
-        # 1. Leitura das bandas e conversão direta para uint8 mantendo cor original
+        # 1. Leitura das bandas e conversão direta para uint8 mantendo cor original, já em alta resolução
         for band_idx, band_name in enumerate(["red", "green", "blue"]):
             band_asset_key = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
             href = band_hrefs[band_asset_key]
@@ -242,8 +246,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
                         window = from_bounds(*geom_bounds_proj, transform=src.transform)
                         window = window.round_offsets().round_lengths()
+                        out_height = int(window.height * upscale_factor)
+                        out_width = int(window.width * upscale_factor)
 
-                    band = src.read(1, window=window, boundless=True)
+                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos)
                     # Conversão direta para uint8 usando divisor fixo (ex: 3000)
                     band = np.clip(band, 0, 3000)
                     band = (band / 3000 * 255).astype(np.uint8)
@@ -258,10 +264,11 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # --- Desenhar polígono amarelo (agora em método separado e suavizado) ---
         return self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=1)
 
-    def _draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="white", width=2, interp_points=100):
+    def _draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="white", width=5, interp_points=200):
         """
         Desenha um polígono suavizado (interpolado) sobre a imagem PIL.
         interp_points: número de pontos interpolados para suavizar a linha.
+        Considera o upscale da imagem para desenhar o polígono no local correto.
         """
         from shapely.geometry import LineString
         draw = ImageDraw.Draw(pil_img)
@@ -274,22 +281,30 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             return (col - window.col_off, row - window.row_off)
 
         coords = list(mapping(geom_proj)["coordinates"][0])
-        # Interpolação para suavizar a linha
         line = LineString(coords)
         if len(coords) < interp_points:
             interp_points = max(len(coords)*3, 50)
         interp_line = [line.interpolate(float(i)/interp_points, normalized=True).coords[0] for i in range(interp_points)]
         pixel_coords = []
+        # Calcular fator de escala real
+        # O window.height/width é o tamanho "original" do crop, pil_img.size é o tamanho real após upscale
+        if window is not None:
+            orig_height = window.height
+            orig_width = window.width
+            img_width, img_height = pil_img.size
+            scale_x = img_width / orig_width if orig_width > 0 else 1.0
+            scale_y = img_height / orig_height if orig_height > 0 else 1.0
+        else:
+            scale_x = scale_y = 1.0
         for coord in interp_line:
             x, y = coord[:2]
             px, py = world_to_pixel(x, y, transform_affine, window)
+            px *= scale_x
+            py *= scale_y
             pixel_coords.append((px, py))
         # Fecha o polígono
         pixel_coords.append(pixel_coords[0])
         draw.line(pixel_coords, fill=color, width=width, joint="curve")
-
-        # 4. Aumentar resolução (fator 3, filtro LANCZOS)
-        pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.LANCZOS)
 
         return self._pil_image_to_base64(pil_img)
     
