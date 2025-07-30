@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeService
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageService
 from app.application.usecases.get_images_by_range import GetImagesByRangeUseCase
+from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayUseCase
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayUseCase
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
@@ -20,14 +21,14 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 # Injeta o repositório com o banco
-def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
+def get_user_repository(db: AsyncSession = Depends(get_db)) -> UserRepository:
     return UserRepository(db)
 
 # Injeta o caso de uso com o repositório
 def get_create_user_usecase(repo: UserRepository = Depends(get_user_repository)) -> CreateUserUseCase:
     return CreateUserUseCase(repo)
 
-def get_api_key_usecase(db: Session = Depends(get_db)) -> ValidateApiKeyUseCase:
+def get_api_key_usecase(db: AsyncSession = Depends(get_db)) -> ValidateApiKeyUseCase:
     repo = ApiKeyRepository(db)
     return ValidateApiKeyUseCase(repo)
 
@@ -38,6 +39,11 @@ def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
 def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:
     planetary_visual_image_service = PlanetaryVisualImageService()
     return GetVisualImageByDayUseCase(planetary_visual_image_service)
+
+def get_ndvi_image_by_day_usecase() -> GetNdviImageByDayUseCase:
+    planetary_visual_image_service = PlanetaryVisualImageService()
+    return GetNdviImageByDayUseCase(planetary_visual_image_service)
+
 
 API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
