@@ -1,10 +1,11 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
+from app.application.usecases.get_all_images_by_day import GetAllImagesByDayRequest, GetAllImagesByDayResponse, GetAllImagesByDayUseCase
 from app.application.usecases.get_images_by_range import GetImagesByRangeRequest, GetImagesByRangeResponse, GetImagesByRangeUseCase
 from app.application.usecases.get_ndmi_image_by_day import GetNdmiImageByDayRequest, GetNdmiImageByDayResponse, GetNdmiImageByDayUseCase
 from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayRequest, GetNdviImageByDayResponse, GetNdviImageByDayUseCase
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayRequest, GetVisualImageByDayResponse, GetVisualImageByDayUseCase
-from app.infraestructure.dependencies import get_images_by_range_usecase, get_ndmi_image_by_day_usecase, get_ndvi_image_by_day_usecase, get_visual_image_by_day_usecase, validate_api_key
+from app.infraestructure.dependencies import get_all_images_by_day_usecase, get_images_by_range_usecase, get_ndmi_image_by_day_usecase, get_ndvi_image_by_day_usecase, get_visual_image_by_day_usecase, validate_api_key
 
 sentinel_router = APIRouter(prefix="/sentinel", tags=["images"])
 
@@ -49,6 +50,17 @@ async def get_ndvi_image_by_day(request: GetNdviImageByDayRequest, usecase: GetN
     response_model=GetNdmiImageByDayResponse,
 )
 async def get_ndmi_image_by_day(request: GetNdmiImageByDayRequest, usecase: GetNdmiImageByDayUseCase = Depends(get_ndmi_image_by_day_usecase)):
+    visual_image = await usecase.execute(request)
+    if visual_image.is_err():
+        raise HTTPException(status_code=400, detail=str(visual_image.error()))
+    return visual_image.value()
+
+@sentinel_router.post(
+    "/all",
+    summary="Obtem os dados de Visual, NDMI e NDVI do dia",
+    response_model=GetAllImagesByDayResponse,
+)
+async def get_all_data_image_by_day(request: GetAllImagesByDayRequest, usecase: GetAllImagesByDayUseCase = Depends(get_all_images_by_day_usecase)):
     visual_image = await usecase.execute(request)
     if visual_image.is_err():
         raise HTTPException(status_code=400, detail=str(visual_image.error()))
