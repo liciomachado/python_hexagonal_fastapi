@@ -11,11 +11,12 @@ class GetNdmiImageByDayRequest(BaseModel):
     day: date
     cloud_percentual: float
     geometry: str
+    generate_image: bool = True
 
 class GetNdmiImageByDayResponse(BaseModel):
     day: date
     cloud_percentual: float
-    base64image: str
+    base64image: str | None
     ndmi_mean: float | None
     ndmi_min: float | None
     ndmi_max: float | None
@@ -29,7 +30,8 @@ class GetNdmiImageByDayUseCase:
         response = await self.planetary_visual_image_service.get_ndmi_image(
             day=request.day,
             cloud_percentual=request.cloud_percentual,
-            geometry=request.geometry
+            geometry=request.geometry,
+            generate_image=request.generate_image
         )
 
         if response.is_err():

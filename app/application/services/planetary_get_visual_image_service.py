@@ -24,21 +24,21 @@ from app.core.utils.result import AppError, BadRequestError, Result
 
 class PlanetaryVisualImageServicePort(ABC):
     @abstractmethod
-    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
     @abstractmethod
     async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
         pass
 
     @abstractmethod
-    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
 
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
-    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         try:
             geom = wkt.loads(geometry)
             bounds = geom.bounds
@@ -81,7 +81,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDMI {e} não disponível na imagem selecionada."))
             # Gera NDMI e retorna imagem + média, min e max
-            image, ndmi_mean, ndmi_min, ndmi_max = await self._download_crop_ndmi_image(assets, geom_bounds, geom)
+            image, ndmi_mean, ndmi_min, ndmi_max = await self._download_crop_ndmi_image(assets, geom_bounds, geom, generate_image)
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
@@ -94,7 +94,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDMI: {str(ex)}")
 
-    async def _download_crop_ndmi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry):
+    async def _download_crop_ndmi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
         from PIL import ImageFilter, Image
         # 1. Abra a SWIR (B11) primeiro para referência de resolução
         swir_href = sign(band_hrefs["B11"])
@@ -134,6 +134,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         else:
             ndmi_mean = ndmi_min = ndmi_max = None
 
+        if not generate_image:
+            return None, ndmi_mean, ndmi_min, ndmi_max
+
         # Aplicar colormap NDMI customizado
         ndmi_rgb = np.zeros(ndmi.shape + (3,), dtype=np.float32)
         for i in range(len(NDMI_BANDWIDTH_COLORS_VALUES) - 1):
@@ -155,7 +158,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
         return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
     
-    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
+    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryImageVisualResponse, AppError]:
         try:
             geom = wkt.loads(geometry)
             bounds = geom.bounds
@@ -220,7 +223,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
 
-    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         try:
             geom = wkt.loads(geometry)
             bounds = geom.bounds
@@ -263,7 +266,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
             # Gera NDVI e retorna imagem + média, min e max
-            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom)
+            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom, generate_image)
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
@@ -276,14 +279,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
 
-    async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry):
+    async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
         from PIL import ImageFilter, Image
         bands_data = []
         transform_affine = None
         image_crs = None
         window = None
         upscale_factor = 3  # Fator de aumento de resolução real
-        # Leitura das bandas Red e NIR em alta resolução
         crop_transform = None
         for band_idx, band_name in enumerate(["red", "nir"]):
             band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
@@ -299,9 +301,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         window = window.round_offsets().round_lengths()
                         out_height = int(window.height * upscale_factor)
                         out_width = int(window.width * upscale_factor)
-                        # Transform do crop já ampliado
                         crop_transform = src.window_transform(window)
-                        # Ajustar o transform para o upscale
                         crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
                     band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
                     bands_data.append(band)
@@ -313,7 +313,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         # Calcular estatísticas apenas dentro do polígono original (geom)
         from rasterio.features import geometry_mask
-        # Polígono no CRS da imagem
         project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
         geom_proj = shapely_transform(project, geom)
         mask = geometry_mask([mapping(geom_proj)], out_shape=ndvi.shape, transform=crop_transform, invert=True)
@@ -325,6 +324,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             ndvi_max = float(np.max(ndvi_inside))
         else:
             ndvi_mean = ndvi_min = ndvi_max = None
+
+        if not generate_image:
+            return None, ndvi_mean, ndvi_min, ndvi_max
 
         # Aplicar colormap NDVI customizado
         ndvi_rgb = np.zeros(ndvi.shape + (3,), dtype=np.float32)
