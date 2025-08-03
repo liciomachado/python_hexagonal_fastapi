@@ -1,9 +1,10 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from app.application.usecases.get_images_by_range import GetImagesByRangeRequest, GetImagesByRangeResponse, GetImagesByRangeUseCase
+from app.application.usecases.get_ndmi_image_by_day import GetNdmiImageByDayRequest, GetNdmiImageByDayResponse, GetNdmiImageByDayUseCase
 from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayRequest, GetNdviImageByDayResponse, GetNdviImageByDayUseCase
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayRequest, GetVisualImageByDayResponse, GetVisualImageByDayUseCase
-from app.infraestructure.dependencies import get_images_by_range_usecase, get_ndvi_image_by_day_usecase, get_visual_image_by_day_usecase, validate_api_key
+from app.infraestructure.dependencies import get_images_by_range_usecase, get_ndmi_image_by_day_usecase, get_ndvi_image_by_day_usecase, get_visual_image_by_day_usecase, validate_api_key
 
 sentinel_router = APIRouter(prefix="/sentinel", tags=["images"])
 
@@ -23,7 +24,7 @@ async def get_images_by_range(request: GetImagesByRangeRequest, usecase: GetImag
     "/visual",
     summary="Obtem a imagem visual do dia",
     response_model=GetVisualImageByDayResponse,
-    dependencies=[Depends(validate_api_key)],
+    #dependencies=[Depends(validate_api_key)],
 )
 async def get_visual_image_by_day(request: GetVisualImageByDayRequest, usecase: GetVisualImageByDayUseCase = Depends(get_visual_image_by_day_usecase)):
     visual_image = await usecase.execute(request)
@@ -37,6 +38,17 @@ async def get_visual_image_by_day(request: GetVisualImageByDayRequest, usecase: 
     response_model=GetNdviImageByDayResponse,
 )
 async def get_ndvi_image_by_day(request: GetNdviImageByDayRequest, usecase: GetNdviImageByDayUseCase = Depends(get_ndvi_image_by_day_usecase)):
+    visual_image = await usecase.execute(request)
+    if visual_image.is_err():
+        raise HTTPException(status_code=400, detail=str(visual_image.error()))
+    return visual_image.value()
+
+@sentinel_router.post(
+    "/ndmi-image",
+    summary="Obtem a imagem NDMI do dia",
+    response_model=GetNdmiImageByDayResponse,
+)
+async def get_ndmi_image_by_day(request: GetNdmiImageByDayRequest, usecase: GetNdmiImageByDayUseCase = Depends(get_ndmi_image_by_day_usecase)):
     visual_image = await usecase.execute(request)
     if visual_image.is_err():
         raise HTTPException(status_code=400, detail=str(visual_image.error()))

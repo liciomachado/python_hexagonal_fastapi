@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-import datetime
+from datetime import datetime
 from typing import Any, List
 from shapely import wkt
 from shapely.geometry import mapping
@@ -35,7 +35,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         return [
             PlanetaryImageFilterResponse(
                 id=feature["id"],
-                datetime=datetime.datetime.fromisoformat(feature["properties"]["datetime"]),
+                datetime=datetime.fromisoformat(feature["properties"]["datetime"]),
                 cloud_cover=feature["properties"].get("eo:cloud_cover"),
                 geometry=feature["geometry"],
                 assets=feature["assets"]
