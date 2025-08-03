@@ -148,6 +148,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         ndmi_rgb = (ndmi_rgb * 255).astype(np.uint8)
         pil_img = Image.fromarray(ndmi_rgb, mode="RGB")
+        # Upscale visual para melhorar resolução aparente (ex: 2x)
+        upscale_vis = 2
+        pil_img = pil_img.resize((pil_img.width * upscale_vis, pil_img.height * upscale_vis), Image.Resampling.LANCZOS)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
         self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
         return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
