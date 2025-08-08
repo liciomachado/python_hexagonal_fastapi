@@ -26,6 +26,7 @@ class PlanetaryVisualImageServicePort(ABC):
     @abstractmethod
     async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
+    
     @abstractmethod
     async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
         pass
@@ -40,20 +41,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
     async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
         try:
-            geom = wkt.loads(geometry)
-            bounds = geom.bounds
-            minx, miny, maxx, maxy = bounds
-            width = maxx - minx
-            height = maxy - miny
-            size = max(width, height)
-            square_parameter = 2
-            center_x = (minx + maxx) / square_parameter
-            center_y = (miny + maxy) / square_parameter
-            square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
-            geojson_geom = mapping(square_geom)
-            buffer = 0.003  # graus
-            geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-            minx, miny, maxx, maxy = square_geom.bounds
+            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
 
             catalog = Client.open(self.STAC_URL)
             search = catalog.search(
@@ -93,6 +81,102 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             ))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDMI: {str(ex)}")
+    
+    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
+        try:
+            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
+
+
+            # Conecta ao STAC com pystac-client
+            catalog = Client.open(self.STAC_URL)
+
+            search = catalog.search(
+                collections=["sentinel-2-l2a"],
+                intersects=geojson_geom,
+                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
+                max_items=10
+            )
+
+            items = list(search.items())
+            if not items:
+                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
+
+            # Ordena por menor cobertura de nuvem
+            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
+
+            selected = None
+            for item in items:
+                if item.geometry is None:
+                    continue
+                image_geom = shape(item.geometry)
+                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
+                    selected = item
+                    break
+
+            if not selected:
+                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
+
+            # Obtém os assets RGB
+            try:
+                assets = self._get_rgb_assets(selected)
+
+            except KeyError as e:
+                return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
+
+            # Chamada ao método que faz o crop e compõe a imagem RGB
+            image = await self._download_crop_rgb_image(assets, geom_bounds, geom)
+
+            return Result.Ok(PlanetaryImageVisualResponse(
+                day=day,
+                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                base64image=image
+            ))
+
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
+
+    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
+        try:
+            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
+
+            catalog = Client.open(self.STAC_URL)
+            search = catalog.search(
+                collections=["sentinel-2-l2a"],
+                intersects=geojson_geom,
+                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
+                max_items=10
+            )
+            items = list(search.items())
+            if not items:
+                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
+            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
+            selected = None
+            for item in items:
+                if item.geometry is None:
+                    continue
+                image_geom = shape(item.geometry)
+                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
+                    selected = item
+                    break
+            if not selected:
+                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
+            try:
+                assets = self._get_ndvi_assets(selected)
+            except KeyError as e:
+                return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
+            # Gera NDVI e retorna imagem + média, min e max
+            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom, generate_image)
+            return Result.Ok(PlanetaryNdviImageResponse(
+                day=day,
+                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                base64image=image,
+                ndvi_mean=ndvi_mean,
+                ndvi_min=ndvi_min,
+                ndvi_max=ndvi_max,
+                sat_image_id=selected.id
+            ))
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
 
     async def _download_crop_ndmi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
         from PIL import ImageFilter, Image
@@ -158,127 +242,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
         return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
     
-    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
-        try:
-            geom = wkt.loads(geometry)
-            bounds = geom.bounds
-            minx, miny, maxx, maxy = bounds
-            width = maxx - minx
-            height = maxy - miny
-            size = max(width, height)
-            square_parameter = 2
-            center_x = (minx + maxx) / square_parameter
-            center_y = (miny + maxy) / square_parameter
-            square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
-            geojson_geom = mapping(square_geom)
-            buffer = 0.003  # graus
-            geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-            minx, miny, maxx, maxy = square_geom.bounds
-
-            # Conecta ao STAC com pystac-client
-            catalog = Client.open(self.STAC_URL)
-
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                intersects=geojson_geom,
-                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-                max_items=10
-            )
-
-            items = list(search.items())
-            if not items:
-                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
-
-            # Ordena por menor cobertura de nuvem
-            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
-
-            selected = None
-            for item in items:
-                if item.geometry is None:
-                    continue
-                image_geom = shape(item.geometry)
-                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
-                    selected = item
-                    break
-
-            if not selected:
-                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-
-            # Obtém os assets RGB
-            try:
-                assets = self._get_rgb_assets(selected)
-
-            except KeyError as e:
-                return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
-
-            # Chamada ao método que faz o crop e compõe a imagem RGB
-            image = await self._download_crop_rgb_image(assets, geom_bounds, geom)
-
-            return Result.Ok(PlanetaryImageVisualResponse(
-                day=day,
-                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
-                base64image=image
-            ))
-
-        except Exception as ex:
-            return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
-
-    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
-        try:
-            geom = wkt.loads(geometry)
-            bounds = geom.bounds
-            minx, miny, maxx, maxy = bounds
-            width = maxx - minx
-            height = maxy - miny
-            size = max(width, height)
-            square_parameter = 2
-            center_x = (minx + maxx) / square_parameter
-            center_y = (miny + maxy) / square_parameter
-            square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
-            geojson_geom = mapping(square_geom)
-            buffer = 0.003  # graus
-            geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-            minx, miny, maxx, maxy = square_geom.bounds
-
-            catalog = Client.open(self.STAC_URL)
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                intersects=geojson_geom,
-                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-                max_items=10
-            )
-            items = list(search.items())
-            if not items:
-                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
-            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
-            selected = None
-            for item in items:
-                if item.geometry is None:
-                    continue
-                image_geom = shape(item.geometry)
-                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
-                    selected = item
-                    break
-            if not selected:
-                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-            try:
-                assets = self._get_ndvi_assets(selected)
-            except KeyError as e:
-                return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
-            # Gera NDVI e retorna imagem + média, min e max
-            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom, generate_image)
-            return Result.Ok(PlanetaryNdviImageResponse(
-                day=day,
-                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
-                base64image=image,
-                ndvi_mean=ndvi_mean,
-                ndvi_min=ndvi_min,
-                ndvi_max=ndvi_max,
-                sat_image_id=selected.id
-            ))
-        except Exception as ex:
-            return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
-
     async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
         from PIL import ImageFilter, Image
         bands_data = []
@@ -465,6 +428,23 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             "B08": item.assets["B08"].href,  # NIR
             "B11": item.assets["B11"].href   # SWIR
         }
+
+    def map_geom(self, geometry):
+        geom = wkt.loads(geometry)
+        bounds = geom.bounds
+        minx, miny, maxx, maxy = bounds
+        width = maxx - minx
+        height = maxy - miny
+        size = max(width, height)
+        square_parameter = 2
+        center_x = (minx + maxx) / square_parameter
+        center_y = (miny + maxy) / square_parameter
+        square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
+        geojson_geom = mapping(square_geom)
+        buffer = 0.003  # graus
+        geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
+        minx, miny, maxx, maxy = square_geom.bounds
+        return geom,geojson_geom,geom_bounds
 # NDVI colormap
 NDVI_BANDWIDTH_COLORS_VALUES = [
     -1.0,

@@ -10,10 +10,10 @@ from app.infraestructure.dependencies import get_all_images_by_day_usecase, get_
 sentinel_router = APIRouter(prefix="/sentinel", tags=["images"])
 
 @sentinel_router.post(
-    "",
+    "/days-available-in-range",
     summary="Obtem todas as imagens disponiveis no range definido",
     response_model=List[GetImagesByRangeResponse],
-    dependencies=[Depends(validate_api_key)],
+    #dependencies=[Depends(validate_api_key)],
 )
 async def get_images_by_range(request: GetImagesByRangeRequest, usecase: GetImagesByRangeUseCase = Depends(get_images_by_range_usecase)):
     images = await usecase.execute(request)
