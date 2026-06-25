@@ -1,9 +1,9 @@
-
 from datetime import date
 
 from pydantic import BaseModel
 
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageServicePort
+from app.application.services.stac.preferred_provider import PreferredProvider
 from app.core.utils.result import AppError, Result
 
 
@@ -12,6 +12,7 @@ class GetAllImagesByDayRequest(BaseModel):
     cloud_percentual: float
     geometry: str
     generate_image: bool = True
+    preferred_provider: PreferredProvider | None = None
 
 
 from .get_visual_image_by_day import GetVisualImageByDayResponse, GetVisualImageByDayUseCase, GetVisualImageByDayRequest
@@ -38,19 +39,22 @@ class GetAllImagesByDayUseCase:
         visual_req = GetVisualImageByDayRequest(
             day=request.day,
             cloud_percentual=request.cloud_percentual,
-            geometry=request.geometry
+            geometry=request.geometry,
+            preferred_provider=request.preferred_provider,
         )
         ndvi_req = GetNdviImageByDayRequest(
             day=request.day,
             cloud_percentual=request.cloud_percentual,
             geometry=request.geometry,
-            generate_image=request.generate_image
+            generate_image=request.generate_image,
+            preferred_provider=request.preferred_provider,
         )
         ndmi_req = GetNdmiImageByDayRequest(
             day=request.day,
             cloud_percentual=request.cloud_percentual,
             geometry=request.geometry,
-            generate_image=request.generate_image
+            generate_image=request.generate_image,
+            preferred_provider=request.preferred_provider,
         )
 
         # Executar em paralelo

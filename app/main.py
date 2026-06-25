@@ -1,8 +1,15 @@
 from fastapi import FastAPI
+
+from app.core.logging_config import setup_logging
+
+setup_logging()
+
+from app.api.middleware.request_logging import RequestLoggingMiddleware
 from app.api.user_routes import user_router
 from app.api.sentinel_routes import sentinel_router
 
 app = FastAPI(title="Hexagonal FastAPI Example")
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(user_router, prefix="/api")
 app.include_router(sentinel_router, prefix="/api")

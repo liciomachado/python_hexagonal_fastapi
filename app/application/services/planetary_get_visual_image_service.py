@@ -10,66 +10,82 @@ from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
 import numpy as np
 import pyproj
-
-from pystac_client import Client
-from planetary_computer import sign
 import rasterio
 
 from rasterio.enums import Resampling
 
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
+from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.stac_resilient_facade import StacResilientFacade
+from app.application.services.stac.stac_types import StacProviderName, resolve_band_href
 from app.core.utils.result import AppError, BadRequestError, Result
 
 
 class PlanetaryVisualImageServicePort(ABC):
     @abstractmethod
-    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
-        pass
-    
-    @abstractmethod
-    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
+    async def get_ndmi_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
     @abstractmethod
-    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_visual_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryImageVisualResponse, AppError]:
+        pass
+
+    @abstractmethod
+    async def get_ndvi_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
 
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
-    STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+    def __init__(self, stac_facade: StacResilientFacade):
+        self._stac_facade = stac_facade
 
-    async def get_ndmi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndmi_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryNdviImageResponse, AppError]:
         try:
             geom, geojson_geom, geom_bounds = self.map_geom(geometry)
-
-            catalog = Client.open(self.STAC_URL)
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                intersects=geojson_geom,
-                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-                max_items=10
+            selected, provider = await self._search_selected_item(
+                day=day,
+                cloud_percentual=cloud_percentual,
+                geom=geom,
+                geojson_geom=geojson_geom,
+                preferred_provider=preferred_provider,
             )
-            items = list(search.items())
-            if not items:
-                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
-            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
-            selected = None
-            for item in items:
-                if item.geometry is None:
-                    continue
-                image_geom = shape(item.geometry)
-                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
-                    selected = item
-                    break
-            if not selected:
+            if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
             try:
                 assets = self._get_ndmi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDMI {e} não disponível na imagem selecionada."))
-            # Gera NDMI e retorna imagem + média, min e max
-            image, ndmi_mean, ndmi_min, ndmi_max = await self._download_crop_ndmi_image(assets, geom_bounds, geom, generate_image)
+            image, ndmi_mean, ndmi_min, ndmi_max = await self._download_crop_ndmi_image(
+                assets, geom_bounds, geom, generate_image, provider
+            )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
@@ -79,52 +95,34 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 ndvi_max=ndmi_max,
                 sat_image_id=selected.id
             ))
+        except ValueError as ex:
+            return Result.Err(str(ex))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDMI: {str(ex)}")
     
-    async def get_visual_image(self, day: date, cloud_percentual: float, geometry: str) -> Result[PlanetaryImageVisualResponse, AppError]:
+    async def get_visual_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryImageVisualResponse, AppError]:
         try:
             geom, geojson_geom, geom_bounds = self.map_geom(geometry)
-
-
-            # Conecta ao STAC com pystac-client
-            catalog = Client.open(self.STAC_URL)
-
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                intersects=geojson_geom,
-                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-                max_items=10
+            selected, provider = await self._search_selected_item(
+                day=day,
+                cloud_percentual=cloud_percentual,
+                geom=geom,
+                geojson_geom=geojson_geom,
+                preferred_provider=preferred_provider,
             )
-
-            items = list(search.items())
-            if not items:
-                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
-
-            # Ordena por menor cobertura de nuvem
-            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
-
-            selected = None
-            for item in items:
-                if item.geometry is None:
-                    continue
-                image_geom = shape(item.geometry)
-                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
-                    selected = item
-                    break
-
-            if not selected:
+            if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-
-            # Obtém os assets RGB
             try:
                 assets = self._get_rgb_assets(selected)
-
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
-
-            # Chamada ao método que faz o crop e compõe a imagem RGB
-            image = await self._download_crop_rgb_image(assets, geom_bounds, geom)
+            image = await self._download_crop_rgb_image(assets, geom_bounds, geom, provider)
 
             return Result.Ok(PlanetaryImageVisualResponse(
                 day=day,
@@ -132,40 +130,37 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 base64image=image
             ))
 
+        except ValueError as ex:
+            return Result.Err(str(ex))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem: {str(ex)}")
 
-    async def get_ndvi_image(self, day: date, cloud_percentual: float, geometry: str, generate_image: bool) -> Result[PlanetaryNdviImageResponse, AppError]:
+    async def get_ndvi_image(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryNdviImageResponse, AppError]:
         try:
             geom, geojson_geom, geom_bounds = self.map_geom(geometry)
-
-            catalog = Client.open(self.STAC_URL)
-            search = catalog.search(
-                collections=["sentinel-2-l2a"],
-                intersects=geojson_geom,
-                datetime=f"{day.isoformat()}T00:00:00Z/{day.isoformat()}T23:59:59Z",
-                max_items=10
+            selected, provider = await self._search_selected_item(
+                day=day,
+                cloud_percentual=cloud_percentual,
+                geom=geom,
+                geojson_geom=geojson_geom,
+                preferred_provider=preferred_provider,
             )
-            items = list(search.items())
-            if not items:
-                return Result.Err("Nenhuma imagem encontrada para a data e geometria fornecidas.")
-            items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
-            selected = None
-            for item in items:
-                if item.geometry is None:
-                    continue
-                image_geom = shape(item.geometry)
-                if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
-                    selected = item
-                    break
-            if not selected:
+            if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
             try:
                 assets = self._get_ndvi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
-            # Gera NDVI e retorna imagem + média, min e max
-            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(assets, geom_bounds, geom, generate_image)
+            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(
+                assets, geom_bounds, geom, generate_image, provider
+            )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
@@ -175,13 +170,57 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 ndvi_max=ndvi_max,
                 sat_image_id=selected.id
             ))
+        except ValueError as ex:
+            return Result.Err(str(ex))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
 
-    async def _download_crop_ndmi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
+    async def _search_selected_item(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geom: BaseGeometry,
+        geojson_geom: dict,
+        preferred_provider: PreferredProvider | None,
+    ) -> tuple[pystac.Item | None, StacProviderName]:
+        provider_enum = self._parse_preferred_provider(preferred_provider)
+        search_result = await self._stac_facade.search_items_by_day(
+            geojson_geom=geojson_geom,
+            day=day,
+            max_items=10,
+            preferred_provider=provider_enum,
+        )
+        items = search_result.items
+        if not items:
+            raise ValueError("Nenhuma imagem encontrada para a data e geometria fornecidas.")
+        items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
+        for item in items:
+            if item.geometry is None:
+                continue
+            image_geom = shape(item.geometry)
+            if geom.intersection(image_geom).area / geom.area >= cloud_percentual / 100.0:
+                return item, search_result.provider
+        return None, search_result.provider
+
+    def _parse_preferred_provider(self, preferred_provider: PreferredProvider | None) -> StacProviderName | None:
+        if preferred_provider is None:
+            return None
+        return StacProviderName(preferred_provider)
+
+    def _sign_url(self, href: str, provider: StacProviderName) -> str:
+        return self._stac_facade.sign_asset_url(href, provider)
+
+    async def _download_crop_ndmi_image(
+        self,
+        band_hrefs: dict,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        generate_image: bool,
+        provider: StacProviderName,
+    ):
         from PIL import ImageFilter, Image
         # 1. Abra a SWIR (B11) primeiro para referência de resolução
-        swir_href = sign(band_hrefs["B11"])
+        swir_href = self._sign_url(band_hrefs["B11"], provider)
         with rasterio.Env():
             with rasterio.open(swir_href) as swir_src:
                 image_crs = swir_src.crs
@@ -196,7 +235,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
                 swir = swir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
         # 2. Abra a NIR (B08) e reamostre para shape da SWIR
-        nir_href = sign(band_hrefs["B08"])
+        nir_href = self._sign_url(band_hrefs["B08"], provider)
         with rasterio.Env():
             with rasterio.open(nir_href) as nir_src:
                 nir = nir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
@@ -242,7 +281,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
         return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
     
-    async def _download_crop_ndvi_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry, generate_image: bool):
+    async def _download_crop_ndvi_image(
+        self,
+        band_hrefs: dict,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        generate_image: bool,
+        provider: StacProviderName,
+    ):
         from PIL import ImageFilter, Image
         bands_data = []
         transform_affine = None
@@ -253,7 +299,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         for band_idx, band_name in enumerate(["red", "nir"]):
             band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
             href = band_hrefs[band_asset_key]
-            href = sign(href)
+            href = self._sign_url(href, provider)
             with rasterio.Env():
                 with rasterio.open(href) as src:
                     if band_idx == 0:
@@ -313,7 +359,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # Não precisa mais aumentar resolução aqui
         return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
         
-    async def _download_crop_rgb_image(self, band_hrefs: dict, geom_bounds: tuple, geom: BaseGeometry) -> str:
+    async def _download_crop_rgb_image(
+        self,
+        band_hrefs: dict,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        provider: StacProviderName,
+    ) -> str:
         from PIL import ImageFilter
 
         bands_data = []
@@ -326,7 +378,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         for band_idx, band_name in enumerate(["red", "green", "blue"]):
             band_asset_key = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
             href = band_hrefs[band_asset_key]
-            href = sign(href)
+            href = self._sign_url(href, provider)
 
             with rasterio.Env():
                 with rasterio.open(href) as src:
@@ -438,21 +490,21 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     
     def _get_rgb_assets(self, item: pystac.Item) -> dict:
         return {
-            "B04": item.assets["B04"].href,
-            "B03": item.assets["B03"].href,
-            "B02": item.assets["B02"].href
+            "B04": resolve_band_href(item, "B04"),
+            "B03": resolve_band_href(item, "B03"),
+            "B02": resolve_band_href(item, "B02"),
         }
-    
+
     def _get_ndvi_assets(self, item: pystac.Item) -> dict:
         return {
-            "B04": item.assets["B04"].href,  # Red
-            "B08": item.assets["B08"].href   # NIR
+            "B04": resolve_band_href(item, "B04"),
+            "B08": resolve_band_href(item, "B08"),
         }
 
     def _get_ndmi_assets(self, item: pystac.Item) -> dict:
         return {
-            "B08": item.assets["B08"].href,  # NIR
-            "B11": item.assets["B11"].href   # SWIR
+            "B08": resolve_band_href(item, "B08"),
+            "B11": resolve_band_href(item, "B11"),
         }
 
     def map_geom(self, geometry):

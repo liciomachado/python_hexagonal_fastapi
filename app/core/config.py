@@ -12,11 +12,11 @@ env_path = Path(".") / f".env.{ENV}"
 load_dotenv(dotenv_path=env_path)
 
 class Config:
-    # ENV = ENV
-    # DEBUG = os.getenv("DEBUG", "False").lower() in ["true", "1", "yes"]
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///:memory:")
     ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-    # CAR_FUNCTION_API_KEY = os.getenv("CAR_FUNCTION_API_KEY", "")
-    # RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
-    # RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
-    # RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
+    STAC_EARTHSEARCH_URL = os.getenv(
+        "STAC_EARTHSEARCH_URL",
+        "https://earth-search.aws.element84.com/v1/search",
+    )
+    STAC_BREAKER_OPEN_SECONDS = int(os.getenv("STAC_BREAKER_OPEN_SECONDS", "300"))
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

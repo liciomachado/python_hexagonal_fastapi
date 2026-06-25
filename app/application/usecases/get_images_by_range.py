@@ -1,6 +1,7 @@
 from typing import Any, List
 
 from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeServicePort
+from app.application.services.stac.preferred_provider import PreferredProvider
 from app.core.utils.result import AppError, NotFoundError, Result
 from datetime import datetime
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ class GetImagesByRangeRequest(BaseModel):
     dt_start: datetime
     dt_end: datetime
     geom: str
+    preferred_provider: PreferredProvider | None = None
     
 class GetImagesByRangeResponse(BaseModel):
     id: str
@@ -24,7 +26,8 @@ class GetImagesByRangeUseCase:
         images = await self.planetary_image_service.search_images(
             geometry=request.geom,
             start_date=request.dt_start,
-            end_date=request.dt_end
+            end_date=request.dt_end,
+            preferred_provider=request.preferred_provider,
         )
 
         if not images:
@@ -32,11 +35,10 @@ class GetImagesByRangeUseCase:
 
         response = [
             GetImagesByRangeResponse(
-            id=image.id,
-            datetime=image.datetime,
-            cloud_cover=image.cloud_cover,
-            geometry=image.geometry,
-            assets=image.assets
+                id=image.id,
+                datetime=image.datetime,
+                cloud_cover=image.cloud_cover,
+                assets=image.assets,
             )
             for image in images
         ]
