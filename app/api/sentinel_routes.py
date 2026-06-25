@@ -1,13 +1,31 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from app.application.usecases.get_all_images_by_day import GetAllImagesByDayRequest, GetAllImagesByDayResponse, GetAllImagesByDayUseCase
 from app.application.usecases.get_images_by_range import GetImagesByRangeRequest, GetImagesByRangeResponse, GetImagesByRangeUseCase
 from app.application.usecases.get_ndmi_image_by_day import GetNdmiImageByDayRequest, GetNdmiImageByDayResponse, GetNdmiImageByDayUseCase
 from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayRequest, GetNdviImageByDayResponse, GetNdviImageByDayUseCase
+from app.application.usecases.check_planetary_computer_health import CheckPlanetaryComputerHealthResponse, CheckPlanetaryComputerHealthUseCase
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayRequest, GetVisualImageByDayResponse, GetVisualImageByDayUseCase
-from app.infraestructure.dependencies import get_all_images_by_day_usecase, get_images_by_range_usecase, get_ndmi_image_by_day_usecase, get_ndvi_image_by_day_usecase, get_visual_image_by_day_usecase, validate_api_key
+from app.infraestructure.dependencies import get_all_images_by_day_usecase, get_images_by_range_usecase, get_ndmi_image_by_day_usecase, get_ndvi_image_by_day_usecase, get_planetary_health_check_usecase, get_visual_image_by_day_usecase, validate_api_key
 
 sentinel_router = APIRouter(prefix="/sentinel", tags=["images"])
+
+@sentinel_router.get(
+    "/health/planetarycomputer",
+    summary="Verifica disponibilidade da API do Planetary Computer",
+    response_model=CheckPlanetaryComputerHealthResponse,
+)
+async def planetary_computer_health(
+    usecase: CheckPlanetaryComputerHealthUseCase = Depends(get_planetary_health_check_usecase),
+):
+    result = await usecase.execute()
+    if result.is_err():
+        raise HTTPException(status_code=500, detail=str(result.error()))
+    health = result.value()
+    if not health.healthy:
+        return JSONResponse(status_code=503, content=health.model_dump())
+    return health
 
 @sentinel_router.post(
     "/days-available-in-range",

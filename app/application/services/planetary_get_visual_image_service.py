@@ -354,13 +354,32 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         # Desenhar polígono já na imagem ampliada, sem resize adicional (width=5 para melhor visualização)
         return self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
 
+    def _extract_boundary_lines(self, geom_proj):
+        from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
+
+        if isinstance(geom_proj, Polygon):
+            return [LineString(geom_proj.exterior.coords)]
+        if isinstance(geom_proj, MultiPolygon):
+            return [LineString(poly.exterior.coords) for poly in geom_proj.geoms]
+        if isinstance(geom_proj, LineString):
+            return [geom_proj]
+        if isinstance(geom_proj, MultiLineString):
+            return list(geom_proj.geoms)
+
+        boundary = geom_proj.boundary
+        if isinstance(boundary, LineString):
+            return [boundary]
+        if isinstance(boundary, MultiLineString):
+            return list(boundary.geoms)
+
+        raise ValueError(f"Unsupported geometry type for drawing: {geom_proj.geom_type}")
+
     def _draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="white", width=5, interp_points=200):
         """
         Desenha um polígono suavizado (interpolado) sobre a imagem PIL.
         interp_points: número de pontos interpolados para suavizar a linha.
         Considera o upscale da imagem para desenhar o polígono no local correto.
         """
-        from shapely.geometry import LineString
         draw = ImageDraw.Draw(pil_img)
         # Transforma geom para o CRS da imagem
         project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
@@ -370,12 +389,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             col, row = ~transform_affine * (x, y)
             return (col - window.col_off, row - window.row_off)
 
-        coords = list(mapping(geom_proj)["coordinates"][0])
-        line = LineString(coords)
-        if len(coords) < interp_points:
-            interp_points = max(len(coords)*3, 50)
-        interp_line = [line.interpolate(float(i)/interp_points, normalized=True).coords[0] for i in range(interp_points)]
-        pixel_coords = []
+        boundary_lines = self._extract_boundary_lines(geom_proj)
+
         # Calcular fator de escala real
         # O window.height/width é o tamanho "original" do crop, pil_img.size é o tamanho real após upscale
         if window is not None:
@@ -386,15 +401,26 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             scale_y = img_height / orig_height if orig_height > 0 else 1.0
         else:
             scale_x = scale_y = 1.0
-        for coord in interp_line:
-            x, y = coord[:2]
-            px, py = world_to_pixel(x, y, transform_affine, window)
-            px *= scale_x
-            py *= scale_y
-            pixel_coords.append((px, py))
-        # Fecha o polígono
-        pixel_coords.append(pixel_coords[0])
-        draw.line(pixel_coords, fill=color, width=width, joint="curve")
+
+        for line in boundary_lines:
+            coords = list(line.coords)
+            line_interp_points = interp_points
+            if len(coords) < line_interp_points:
+                line_interp_points = max(len(coords) * 3, 50)
+            interp_line = [
+                line.interpolate(float(i) / line_interp_points, normalized=True).coords[0]
+                for i in range(line_interp_points)
+            ]
+            pixel_coords = []
+            for coord in interp_line:
+                x, y = coord[:2]
+                px, py = world_to_pixel(x, y, transform_affine, window)
+                px *= scale_x
+                py *= scale_y
+                pixel_coords.append((px, py))
+            # Fecha o polígono
+            pixel_coords.append(pixel_coords[0])
+            draw.line(pixel_coords, fill=color, width=width, joint="curve")
 
         return self._pil_image_to_base64(pil_img)
 

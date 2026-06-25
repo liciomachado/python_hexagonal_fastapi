@@ -3,8 +3,10 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, HTTPException, Header, Security
 from sqlalchemy.orm import Session
+from app.application.services.planetary_health_check_service import PlanetaryHealthCheckService
 from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeService
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageService
+from app.application.usecases.check_planetary_computer_health import CheckPlanetaryComputerHealthUseCase
 from app.application.usecases.get_all_images_by_day import GetAllImagesByDayUseCase
 from app.application.usecases.get_images_by_range import GetImagesByRangeUseCase
 from app.application.usecases.get_ndmi_image_by_day import GetNdmiImageByDayUseCase
@@ -53,6 +55,10 @@ def get_ndmi_image_by_day_usecase() -> GetNdmiImageByDayUseCase:
 def get_all_images_by_day_usecase() -> GetAllImagesByDayUseCase:
     planetary_visual_image_service = PlanetaryVisualImageService()
     return GetAllImagesByDayUseCase(planetary_visual_image_service)
+
+def get_planetary_health_check_usecase() -> CheckPlanetaryComputerHealthUseCase:
+    planetary_health_check_service = PlanetaryHealthCheckService()
+    return CheckPlanetaryComputerHealthUseCase(planetary_health_check_service)
 
 API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
