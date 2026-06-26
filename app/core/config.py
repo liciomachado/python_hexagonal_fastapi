@@ -27,4 +27,5 @@ class Config:
     IMAGE_POLYGON_BORDER_WIDTH = int(os.getenv("IMAGE_POLYGON_BORDER_WIDTH", "10"))
     IMAGE_ENABLE_SHARPEN = os.getenv("IMAGE_ENABLE_SHARPEN", "false").lower() == "true"
     SCL_MAX_DIMENSION = int(os.getenv("SCL_MAX_DIMENSION", "512"))
+    SCL_CONCURRENT_READS = int(os.getenv("SCL_CONCURRENT_READS", "5"))
     VSI_CACHE_SIZE = os.getenv("VSI_CACHE_SIZE", "134217728")

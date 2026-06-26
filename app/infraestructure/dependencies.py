@@ -5,6 +5,7 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, HTTPException, Security
 from app.application.services.planetary_health_check_service import PlanetaryHealthCheckService
+from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeService
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageService
 from app.application.usecases.check_planetary_computer_health import CheckPlanetaryComputerHealthUseCase
@@ -38,9 +39,16 @@ def get_api_key_usecase(db: AsyncSession = Depends(get_db)) -> ValidateApiKeyUse
     repo = ApiKeyRepository(db)
     return ValidateApiKeyUseCase(repo)
 
+@lru_cache
+def _get_geometry_cloud_cover_service() -> GeometryCloudCoverService:
+    return GeometryCloudCoverService(get_stac_facade())
+
 def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
     stac_facade = get_stac_facade()
-    planetary_image_service = PlanetaryGetOptionImagesByRangeService(stac_facade)
+    planetary_image_service = PlanetaryGetOptionImagesByRangeService(
+        stac_facade,
+        cloud_cover_service=_get_geometry_cloud_cover_service(),
+    )
     return GetImagesByRangeUseCase(planetary_image_service)
 
 @lru_cache
@@ -49,6 +57,7 @@ def _get_planetary_visual_image_service() -> PlanetaryVisualImageService:
         stac_facade=get_stac_facade(),
         cache_service=get_cache_service(),
         blob_storage=get_blob_storage_service(),
+        cloud_cover_service=_get_geometry_cloud_cover_service(),
     )
 
 def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:

@@ -1,14 +1,20 @@
+import asyncio
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, List
+from typing import List
+
+import pystac
 from shapely import wkt
 from shapely.geometry import mapping
-from collections import defaultdict
+from shapely.geometry.base import BaseGeometry
 
 from app.application.services.dtos.planetary_images_filter_response import PlanetaryImageFilterResponse
+from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.stac.preferred_provider import PreferredProvider
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName
+from app.core.config import Config
 
 
 class PlanetaryGetOptionImagesByRangeServicePort(ABC):
@@ -25,8 +31,13 @@ class PlanetaryGetOptionImagesByRangeServicePort(ABC):
 
 class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServicePort):
 
-    def __init__(self, stac_facade: StacResilientFacade):
+    def __init__(
+        self,
+        stac_facade: StacResilientFacade,
+        cloud_cover_service: GeometryCloudCoverService | None = None,
+    ):
         self._stac_facade = stac_facade
+        self._cloud_cover_service = cloud_cover_service or GeometryCloudCoverService(stac_facade)
 
     async def search_images(
         self,
@@ -35,8 +46,8 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         end_date: datetime,
         preferred_provider: PreferredProvider | None = None,
     ) -> List[PlanetaryImageFilterResponse]:
-        shapely_geom = wkt.loads(geometry)
-        geojson_geom = mapping(shapely_geom)
+        geom, geom_bounds = self._parse_geometry(geometry)
+        geojson_geom = mapping(geom)
         start_date, end_date = self.adjustDates(start_date, end_date)
         provider_enum = StacProviderName(preferred_provider) if preferred_provider else None
 
@@ -48,6 +59,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
             preferred_provider=provider_enum,
         )
 
+        items_by_id = {item.id: item for item in search_result.items}
         features = [
             {
                 "id": item.id,
@@ -57,7 +69,50 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
             }
             for item in search_result.items
         ]
-        return self.mapAndGroupResult(features)
+        grouped = self.mapAndGroupResult(features)
+        return await self._enrich_with_geometry_cloud_cover(
+            grouped,
+            items_by_id,
+            geom,
+            geom_bounds,
+            search_result.provider,
+        )
+
+    async def _enrich_with_geometry_cloud_cover(
+        self,
+        items: List[PlanetaryImageFilterResponse],
+        items_by_id: dict[str, pystac.Item],
+        geom: BaseGeometry,
+        geom_bounds: tuple[float, float, float, float],
+        provider: StacProviderName,
+    ) -> List[PlanetaryImageFilterResponse]:
+        if not items:
+            return items
+
+        semaphore = asyncio.Semaphore(Config.SCL_CONCURRENT_READS)
+
+        async def enrich(item: PlanetaryImageFilterResponse) -> None:
+            stac_item = items_by_id.get(item.id)
+            if stac_item is None:
+                return
+            async with semaphore:
+                item.cloud_cover_geometry = await asyncio.to_thread(
+                    self._cloud_cover_service.compute_cloud_percentual_over_geometry,
+                    stac_item,
+                    geom,
+                    geom_bounds,
+                    provider,
+                )
+
+        await asyncio.gather(*(enrich(item) for item in items))
+        return items
+
+    def _parse_geometry(self, geometry: str) -> tuple[BaseGeometry, tuple[float, float, float, float]]:
+        geom = wkt.loads(geometry)
+        minx, miny, maxx, maxy = geom.bounds
+        buffer = 0.050
+        geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
+        return geom, geom_bounds
 
     def mapAndGroupResult(self, features) -> List[PlanetaryImageFilterResponse]:
         responses = [

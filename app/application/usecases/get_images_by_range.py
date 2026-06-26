@@ -16,7 +16,7 @@ class GetImagesByRangeResponse(BaseModel):
     id: str
     datetime: datetime
     cloud_cover: float | None
-    assets: dict[str, Any]
+    cloud_cover_geometry: float | None
 
 class GetImagesByRangeUseCase:
     def __init__(self, planetary_image_service: PlanetaryGetOptionImagesByRangeServicePort):
@@ -38,7 +38,7 @@ class GetImagesByRangeUseCase:
                 id=image.id,
                 datetime=image.datetime,
                 cloud_cover=image.cloud_cover,
-                assets=image.assets,
+                cloud_cover_geometry=image.cloud_cover_geometry,
             )
             for image in images
         ]

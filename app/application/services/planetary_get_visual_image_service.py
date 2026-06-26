@@ -14,7 +14,6 @@ import rasterio
 from PIL import Image, ImageDraw, ImageFilter
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
-from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
 from shapely import wkt
 from shapely.geometry import mapping, box, shape
@@ -24,6 +23,8 @@ from shapely.ops import transform as shapely_transform
 from app.application.services.dtos.planetary_all_images_response import PlanetaryAllImagesResponse
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
+from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
+from app.application.services.raster_helpers import build_rasterio_gdal_config, compute_out_shape, window_from_bounds
 from app.application.services.stac.preferred_provider import PreferredProvider
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName, resolve_band_href
@@ -36,31 +37,9 @@ from app.domain.ports.cache_port import CachePort
 
 logger = logging.getLogger("app.image")
 
-SCL_CLOUD_CLASSES = frozenset({3, 8, 9, 10})
 REPORT_MAX_IMAGE_DIMENSION = 1200
 REPORT_JPEG_QUALITY = 85
 ALL_PRODUCT_BANDS = ("B02", "B03", "B04", "B08", "B11")
-
-
-def _build_rasterio_gdal_config() -> dict[str, str]:
-    return {
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-        "GDAL_HTTP_MULTIPLEX": "YES",
-        "GDAL_HTTP_VERSION": "2",
-        "VSI_CACHE": "TRUE",
-        "VSI_CACHE_SIZE": Config.VSI_CACHE_SIZE,
-    }
-
-
-def _compute_out_shape(window, max_dimension: int) -> tuple[int, int]:
-    out_height = max(1, int(window.height))
-    out_width = max(1, int(window.width))
-    max_dim = max(out_height, out_width)
-    if max_dim <= max_dimension:
-        return out_height, out_width
-    scale = max_dimension / max_dim
-    return max(1, int(out_height * scale)), max(1, int(out_width * scale))
 
 
 @dataclass
@@ -124,11 +103,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         stac_facade: StacResilientFacade,
         cache_service: CachePort | None = None,
         blob_storage: BlobStoragePort | None = None,
+        cloud_cover_service: GeometryCloudCoverService | None = None,
     ):
         self._stac_facade = stac_facade
         self._cache = cache_service
         self._blob_storage = blob_storage
-        self._gdal_config = _build_rasterio_gdal_config()
+        self._cloud_cover_service = cloud_cover_service or GeometryCloudCoverService(stac_facade)
+        self._gdal_config = build_rasterio_gdal_config()
         self._interp_points = Config.IMAGE_POLYGON_INTERP_POINTS
         self._border_width = Config.IMAGE_POLYGON_BORDER_WIDTH
         self._enable_sharpen = Config.IMAGE_ENABLE_SHARPEN
@@ -431,7 +412,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         with metrics.span("scl_read"):
             geometry_cloud_percentual = await asyncio.to_thread(
-                self._compute_cloud_percentual_over_geometry,
+                self._cloud_cover_service.compute_cloud_percentual_over_geometry,
                 selected,
                 geom,
                 geom_bounds,
@@ -473,46 +454,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 return item, search_result.provider
         return None, search_result.provider
 
-    def _compute_cloud_percentual_over_geometry(
-        self,
-        item: pystac.Item,
-        geom: BaseGeometry,
-        geom_bounds: tuple,
-        provider: StacProviderName,
-    ) -> float:
-        try:
-            scl_href = self._sign_url(resolve_band_href(item, "SCL"), provider)
-        except KeyError:
-            return float(item.properties.get("eo:cloud_cover", 0.0))
-
-        with rasterio.Env(**self._gdal_config):
-            with rasterio.open(scl_href) as src:
-                image_crs = src.crs
-                geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
-                window = from_bounds(*geom_bounds_proj, transform=src.transform)
-                window = window.round_offsets().round_lengths()
-                scl_out_shape = _compute_out_shape(window, Config.SCL_MAX_DIMENSION)
-                scl = src.read(
-                    1,
-                    window=window,
-                    out_shape=scl_out_shape,
-                    resampling=Resampling.average,
-                )
-                crop_transform = src.window_transform(window)
-                scale_x = window.width / scl_out_shape[1]
-                scale_y = window.height / scl_out_shape[0]
-                crop_transform = crop_transform * crop_transform.scale(scale_x, scale_y)
-
-        project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
-        geom_proj = shapely_transform(project, geom)
-        mask = geometry_mask([mapping(geom_proj)], out_shape=scl.shape, transform=crop_transform, invert=True)
-        scl_inside = scl[mask]
-        if scl_inside.size == 0:
-            return float(item.properties.get("eo:cloud_cover", 0.0))
-
-        cloud_pixels = int(np.isin(scl_inside, list(SCL_CLOUD_CLASSES)).sum())
-        return round(cloud_pixels / scl_inside.size * 100, 2)
-
     def _validate_geometry_cloud_percentual(
         self,
         computed_cloud_percentual: float,
@@ -531,16 +472,21 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom_bounds: tuple,
         provider: StacProviderName,
         band_keys: tuple[str, ...],
+        reference_band_key: str = "B04",
     ) -> tuple[dict[str, np.ndarray], RasterContext]:
-        reference_href = self._sign_url(resolve_band_href(item, "B04"), provider)
+        reference_href = self._sign_url(resolve_band_href(item, reference_band_key), provider)
         with rasterio.Env(**self._gdal_config):
             with rasterio.open(reference_href) as ref_src:
                 image_crs = ref_src.crs
                 transform_affine = ref_src.transform
                 geom_bounds_proj = transform_bounds("EPSG:4326", ref_src.crs, *geom_bounds)
-                window = from_bounds(*geom_bounds_proj, transform=ref_src.transform)
-                window = window.round_offsets().round_lengths()
-                out_height, out_width = _compute_out_shape(window, REPORT_MAX_IMAGE_DIMENSION)
+                window = window_from_bounds(
+                    geom_bounds_proj,
+                    ref_src.transform,
+                    ref_src.width,
+                    ref_src.height,
+                )
+                out_height, out_width = compute_out_shape(window, REPORT_MAX_IMAGE_DIMENSION)
                 crop_transform = ref_src.window_transform(window)
                 scale_x = window.width / out_width
                 scale_y = window.height / out_height
@@ -562,9 +508,15 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             for band_key in band_keys:
                 href = self._sign_url(resolve_band_href(item, band_key), provider)
                 with rasterio.open(href) as src:
+                    band_window = window_from_bounds(
+                        geom_bounds_proj,
+                        src.transform,
+                        src.width,
+                        src.height,
+                    )
                     bands[band_key] = src.read(
                         1,
-                        window=window,
+                        window=band_window,
                         out_shape=out_shape,
                         resampling=resampling,
                     ).astype(np.float32)
@@ -621,7 +573,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         generate_image: bool,
         provider: StacProviderName,
     ) -> tuple[bytes | None, float | None, float | None, float | None]:
-        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B08", "B11"))
+        bands, ctx = self._read_shared_bands(
+            item,
+            geom_bounds,
+            provider,
+            ("B08", "B11"),
+            reference_band_key="B11",
+        )
         return self._build_index_product(
             bands["B08"],
             bands["B11"],
@@ -890,7 +848,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             center_y + size / square_parameter,
         )
         geojson_geom = mapping(square_geom)
-        buffer = 0.003
+        buffer = 0.050
         geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
         return geom, geojson_geom, geom_bounds
 
