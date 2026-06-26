@@ -17,6 +17,7 @@ BAND_ASSET_ALIASES: dict[str, list[str]] = {
     "B04": ["B04", "red"],
     "B08": ["B08", "nir"],
     "B11": ["B11", "swir16", "swir"],
+    "SCL": ["SCL", "scl"],
 }
 
 

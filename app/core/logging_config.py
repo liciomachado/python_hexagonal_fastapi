@@ -20,3 +20,6 @@ def setup_logging() -> None:
 
     if level > logging.DEBUG:
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Informativo a cada rasterio.open(); não indica erro nem impacto em URLs HTTPS/Azure
+    logging.getLogger("rasterio.session").setLevel(logging.WARNING)

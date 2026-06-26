@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import asyncio
 from datetime import date
 from PIL import Image, ImageDraw
 import pystac
@@ -20,6 +21,24 @@ from app.application.services.stac.preferred_provider import PreferredProvider
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName, resolve_band_href
 from app.core.utils.result import AppError, BadRequestError, Result
+
+# Sentinel-2 SCL: cloud shadow (3), medium/high cloud (8, 9), thin cirrus (10)
+SCL_CLOUD_CLASSES = frozenset({3, 8, 9, 10})
+
+# Dimensões adequadas para exibição em relatório PDF (~150 DPI em A4)
+REPORT_MAX_IMAGE_DIMENSION = 1200
+REPORT_JPEG_QUALITY = 85
+READ_RESAMPLE_FACTOR = 1
+
+# Otimiza leitura de COGs remotos via HTTP (Azure Blob / vsicurl)
+RASTERIO_GDAL_CONFIG = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+    "GDAL_HTTP_MULTIPLEX": "YES",
+    "GDAL_HTTP_VERSION": "2",
+    "VSI_CACHE": "TRUE",
+    "VSI_CACHE_SIZE": "5000000",
+}
 
 
 class PlanetaryVisualImageServicePort(ABC):
@@ -83,12 +102,19 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_ndmi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDMI {e} não disponível na imagem selecionada."))
-            image, ndmi_mean, ndmi_min, ndmi_max = await self._download_crop_ndmi_image(
-                assets, geom_bounds, geom, generate_image, provider
+            (image, ndmi_mean, ndmi_min, ndmi_max), geometry_cloud_percentual = await asyncio.gather(
+                asyncio.to_thread(
+                    self._download_crop_ndmi_image,
+                    assets, geom_bounds, geom, generate_image, provider,
+                ),
+                asyncio.to_thread(
+                    self._compute_cloud_percentual_over_geometry,
+                    selected, geom, geom_bounds, provider,
+                ),
             )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
-                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                cloud_percentual=geometry_cloud_percentual,
                 base64image=image,
                 ndvi_mean=ndmi_mean,
                 ndvi_min=ndmi_min,
@@ -122,11 +148,20 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_rgb_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
-            image = await self._download_crop_rgb_image(assets, geom_bounds, geom, provider)
+            image, geometry_cloud_percentual = await asyncio.gather(
+                asyncio.to_thread(
+                    self._download_crop_rgb_image,
+                    assets, geom_bounds, geom, provider,
+                ),
+                asyncio.to_thread(
+                    self._compute_cloud_percentual_over_geometry,
+                    selected, geom, geom_bounds, provider,
+                ),
+            )
 
             return Result.Ok(PlanetaryImageVisualResponse(
                 day=day,
-                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                cloud_percentual=geometry_cloud_percentual,
                 base64image=image
             ))
 
@@ -158,12 +193,19 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_ndvi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
-            image, ndvi_mean, ndvi_min, ndvi_max = await self._download_crop_ndvi_image(
-                assets, geom_bounds, geom, generate_image, provider
+            (image, ndvi_mean, ndvi_min, ndvi_max), geometry_cloud_percentual = await asyncio.gather(
+                asyncio.to_thread(
+                    self._download_crop_ndvi_image,
+                    assets, geom_bounds, geom, generate_image, provider,
+                ),
+                asyncio.to_thread(
+                    self._compute_cloud_percentual_over_geometry,
+                    selected, geom, geom_bounds, provider,
+                ),
             )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
-                cloud_percentual=selected.properties.get("eo:cloud_cover", 0.0),
+                cloud_percentual=geometry_cloud_percentual,
                 base64image=image,
                 ndvi_mean=ndvi_mean,
                 ndvi_min=ndvi_min,
@@ -202,6 +244,48 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 return item, search_result.provider
         return None, search_result.provider
 
+    def _compute_cloud_percentual_over_geometry(
+        self,
+        item: pystac.Item,
+        geom: BaseGeometry,
+        geom_bounds: tuple,
+        provider: StacProviderName,
+    ) -> float:
+        from rasterio.features import geometry_mask
+
+        try:
+            scl_href = self._sign_url(resolve_band_href(item, "SCL"), provider)
+        except KeyError:
+            return float(item.properties.get("eo:cloud_cover", 0.0))
+
+        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
+            with rasterio.open(scl_href) as src:
+                image_crs = src.crs
+                geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
+                window = from_bounds(*geom_bounds_proj, transform=src.transform)
+                window = window.round_offsets().round_lengths()
+                scl = src.read(1, window=window)
+                crop_transform = src.window_transform(window)
+
+        project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
+        geom_proj = shapely_transform(project, geom)
+        mask = geometry_mask([mapping(geom_proj)], out_shape=scl.shape, transform=crop_transform, invert=True)
+        scl_inside = scl[mask]
+        if scl_inside.size == 0:
+            return float(item.properties.get("eo:cloud_cover", 0.0))
+
+        cloud_pixels = int(np.isin(scl_inside, list(SCL_CLOUD_CLASSES)).sum())
+        return round(cloud_pixels / scl_inside.size * 100, 2)
+
+    def _prepare_image_for_report(self, pil_img: Image.Image) -> Image.Image:
+        width, height = pil_img.size
+        max_dim = max(width, height)
+        if max_dim <= REPORT_MAX_IMAGE_DIMENSION:
+            return pil_img
+        scale = REPORT_MAX_IMAGE_DIMENSION / max_dim
+        new_size = (int(width * scale), int(height * scale))
+        return pil_img.resize(new_size, Image.Resampling.LANCZOS)
+
     def _parse_preferred_provider(self, preferred_provider: PreferredProvider | None) -> StacProviderName | None:
         if preferred_provider is None:
             return None
@@ -210,7 +294,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     def _sign_url(self, href: str, provider: StacProviderName) -> str:
         return self._stac_facade.sign_asset_url(href, provider)
 
-    async def _download_crop_ndmi_image(
+    def _download_crop_ndmi_image(
         self,
         band_hrefs: dict,
         geom_bounds: tuple,
@@ -221,24 +305,25 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         from PIL import ImageFilter, Image
         # 1. Abra a SWIR (B11) primeiro para referência de resolução
         swir_href = self._sign_url(band_hrefs["B11"], provider)
-        with rasterio.Env():
+        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
             with rasterio.open(swir_href) as swir_src:
                 image_crs = swir_src.crs
                 transform_affine = swir_src.transform
                 geom_bounds_proj = transform_bounds("EPSG:4326", swir_src.crs, *geom_bounds)
                 window = from_bounds(*geom_bounds_proj, transform=swir_src.transform)
                 window = window.round_offsets().round_lengths()
-                upscale_factor = 3
-                out_height = int(window.height * upscale_factor)
-                out_width = int(window.width * upscale_factor)
+                upscale_factor = READ_RESAMPLE_FACTOR
+                out_height = max(1, int(window.height * upscale_factor))
+                out_width = max(1, int(window.width * upscale_factor))
                 crop_transform = swir_src.window_transform(window)
                 crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
-                swir = swir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
+                resampling = Resampling.lanczos if upscale_factor != 1 else Resampling.nearest
+                swir = swir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
         # 2. Abra a NIR (B08) e reamostre para shape da SWIR
         nir_href = self._sign_url(band_hrefs["B08"], provider)
-        with rasterio.Env():
+        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
             with rasterio.open(nir_href) as nir_src:
-                nir = nir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
+                nir = nir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
         # NDMI calculation
         ndmi = (nir - swir) / (nir + swir + 1e-6)
         ndmi = np.clip(ndmi, -1, 1)
@@ -274,14 +359,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         ndmi_rgb = (ndmi_rgb * 255).astype(np.uint8)
         pil_img = Image.fromarray(ndmi_rgb, mode="RGB")
-        # Upscale visual para melhorar resolução aparente (ex: 2x)
-        upscale_vis = 2
-        pil_img = pil_img.resize((pil_img.width * upscale_vis, pil_img.height * upscale_vis), Image.Resampling.LANCZOS)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
+        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
+        pil_img = self._prepare_image_for_report(pil_img)
         return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
     
-    async def _download_crop_ndvi_image(
+    def _download_crop_ndvi_image(
         self,
         band_hrefs: dict,
         geom_bounds: tuple,
@@ -294,13 +377,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         transform_affine = None
         image_crs = None
         window = None
-        upscale_factor = 3  # Fator de aumento de resolução real
+        upscale_factor = READ_RESAMPLE_FACTOR
         crop_transform = None
         for band_idx, band_name in enumerate(["red", "nir"]):
             band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
             href = band_hrefs[band_asset_key]
             href = self._sign_url(href, provider)
-            with rasterio.Env():
+            with rasterio.Env(**RASTERIO_GDAL_CONFIG):
                 with rasterio.open(href) as src:
                     if band_idx == 0:
                         image_crs = src.crs
@@ -308,11 +391,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
                         window = from_bounds(*geom_bounds_proj, transform=src.transform)
                         window = window.round_offsets().round_lengths()
-                        out_height = int(window.height * upscale_factor)
-                        out_width = int(window.width * upscale_factor)
+                        out_height = max(1, int(window.height * upscale_factor))
+                        out_width = max(1, int(window.width * upscale_factor))
                         crop_transform = src.window_transform(window)
                         crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
-                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos).astype(np.float32)
+                    resampling = Resampling.lanczos if upscale_factor != 1 else Resampling.nearest
+                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
                     bands_data.append(band)
         red = bands_data[0]
         nir = bands_data[1]
@@ -352,14 +436,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         ndvi_rgb = (ndvi_rgb * 255).astype(np.uint8)
         pil_img = Image.fromarray(ndvi_rgb, mode="RGB")
-        # Sharpen opcional
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        # Desenhar polígono
-        self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
-        # Não precisa mais aumentar resolução aqui
+        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
+        pil_img = self._prepare_image_for_report(pil_img)
         return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
         
-    async def _download_crop_rgb_image(
+    def _download_crop_rgb_image(
         self,
         band_hrefs: dict,
         geom_bounds: tuple,
@@ -372,15 +454,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         transform_affine = None
         image_crs = None
         window = None
-        upscale_factor = 3  # Fator de aumento de resolução real
+        upscale_factor = READ_RESAMPLE_FACTOR
 
-        # 1. Leitura das bandas e conversão direta para uint8 mantendo cor original, já em alta resolução
         for band_idx, band_name in enumerate(["red", "green", "blue"]):
             band_asset_key = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
             href = band_hrefs[band_asset_key]
             href = self._sign_url(href, provider)
 
-            with rasterio.Env():
+            with rasterio.Env(**RASTERIO_GDAL_CONFIG):
                 with rasterio.open(href) as src:
                     if band_idx == 0:
                         image_crs = src.crs
@@ -388,10 +469,15 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
                         window = from_bounds(*geom_bounds_proj, transform=src.transform)
                         window = window.round_offsets().round_lengths()
-                        out_height = int(window.height * upscale_factor)
-                        out_width = int(window.width * upscale_factor)
+                        out_height = max(1, int(window.height * upscale_factor))
+                        out_width = max(1, int(window.width * upscale_factor))
 
-                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=Resampling.lanczos)
+                    band = src.read(
+                        1,
+                        window=window,
+                        out_shape=(out_height, out_width),
+                        resampling=Resampling.lanczos if upscale_factor != 1 else Resampling.nearest,
+                    )
                     # Conversão direta para uint8 usando divisor fixo (ex: 3000)
                     band = np.clip(band, 0, 3000)
                     band = (band / 3000 * 255).astype(np.uint8)
@@ -402,9 +488,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         # 3. (Opcional: Sharpening pode ser mantido ou removido, aqui mantido para leve nitidez)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
-
-        # Desenhar polígono já na imagem ampliada, sem resize adicional (width=5 para melhor visualização)
-        return self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=5)
+        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
+        pil_img = self._prepare_image_for_report(pil_img)
+        return self._pil_image_to_base64(pil_img)
 
     def _extract_boundary_lines(self, geom_proj):
         from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
@@ -474,7 +560,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             pixel_coords.append(pixel_coords[0])
             draw.line(pixel_coords, fill=color, width=width, joint="curve")
 
-        return self._pil_image_to_base64(pil_img)
+        return pil_img
 
     def _pil_image_to_base64(self, pil_img: Image.Image) -> str:
         """
@@ -484,7 +570,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         from io import BytesIO
 
         buffered = BytesIO()
-        pil_img.save(buffered, format="JPEG", quality=95)
+        pil_img.save(buffered, format="JPEG", quality=REPORT_JPEG_QUALITY, optimize=True)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         return img_str
     

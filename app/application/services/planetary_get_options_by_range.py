@@ -24,7 +24,6 @@ class PlanetaryGetOptionImagesByRangeServicePort(ABC):
 
 
 class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServicePort):
-    BASE_URL = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 
     def __init__(self, stac_facade: StacResilientFacade):
         self._stac_facade = stac_facade
