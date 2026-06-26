@@ -13,7 +13,7 @@ class GetVisualImageByDayRequest(BaseModel):
 class GetVisualImageByDayResponse(BaseModel):
     day: date
     cloud_percentual: float
-    base64image: str
+    image_url: str
 
 class GetVisualImageByDayUseCase:
     def __init__(self, planetary_visual_image_service: PlanetaryVisualImageServicePort):
@@ -32,6 +32,6 @@ class GetVisualImageByDayUseCase:
         return Result.Ok(GetVisualImageByDayResponse(
             day=response.day,
             cloud_percentual=response.cloud_percentual,
-            base64image=response.base64image
+            image_url=response.image_url
         ))
     

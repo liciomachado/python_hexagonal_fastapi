@@ -13,10 +13,11 @@ class GetNdviImageByDayRequest(BaseModel):
     geometry: str
     generate_image: bool = True
     preferred_provider: PreferredProvider | None = None
+
 class GetNdviImageByDayResponse(BaseModel):
     day: date
     cloud_percentual: float
-    base64image: str | None
+    image_url: str | None
     ndvi_mean: float | None
     ndvi_min: float | None
     ndvi_max: float | None
@@ -41,7 +42,7 @@ class GetNdviImageByDayUseCase:
         return Result.Ok(GetNdviImageByDayResponse(
             day=response.day,
             cloud_percentual=response.cloud_percentual,
-            base64image=response.base64image,
+            image_url=response.image_url,
             ndvi_mean=response.ndvi_mean,
             ndvi_min=response.ndvi_min,
             ndvi_max=response.ndvi_max,

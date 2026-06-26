@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 
 import httpx
 
-from app.core.http_client import create_async_http_client
+from app.core.http_client import get_shared_http_client
 from app.application.services.stac.stac_provider_port import StacProviderPort
 from app.application.services.stac.stac_types import (
     SENTINEL2_L2A_COLLECTION,
@@ -61,8 +61,8 @@ class BaseHttpStacProvider(StacProviderPort, ABC):
     async def health_check(self) -> tuple[bool, int | None, str]:
         payload = {"collections": [SENTINEL2_L2A_COLLECTION], "limit": 1}
         try:
-            async with create_async_http_client(timeout=self.TIMEOUT_SECONDS) as client:
-                response = await client.post(self._search_url, json=payload)
+            client = await get_shared_http_client(timeout=self.TIMEOUT_SECONDS)
+            response = await client.post(self._search_url, json=payload)
             if response.status_code == 200:
                 count = len(response.json().get("features", []))
                 return True, response.status_code, f"Busca STAC executada com sucesso ({count} item(s))"
@@ -75,8 +75,8 @@ class BaseHttpStacProvider(StacProviderPort, ABC):
 
     async def _post_search(self, payload: dict) -> list[dict]:
         try:
-            async with create_async_http_client(timeout=self.TIMEOUT_SECONDS) as client:
-                response = await client.post(self._search_url, json=payload)
+            client = await get_shared_http_client(timeout=self.TIMEOUT_SECONDS)
+            response = await client.post(self._search_url, json=payload)
         except httpx.TimeoutException as exc:
             raise StacGatewayTimeoutError(
                 "Timeout ao conectar com a API STAC",

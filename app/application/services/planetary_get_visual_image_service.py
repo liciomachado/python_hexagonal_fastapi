@@ -1,44 +1,76 @@
 from abc import ABC, abstractmethod
 import asyncio
+import json
+import logging
+import uuid
+from dataclasses import dataclass
 from datetime import date
-from PIL import Image, ImageDraw
+from io import BytesIO
+
+import numpy as np
+import pyproj
 import pystac
+import rasterio
+from PIL import Image, ImageDraw, ImageFilter
+from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
+from rasterio.windows import from_bounds
+from rasterio.warp import transform_bounds
 from shapely import wkt
 from shapely.geometry import mapping, box, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shapely_transform
-from rasterio.windows import from_bounds
-from rasterio.warp import transform_bounds
-import numpy as np
-import pyproj
-import rasterio
 
-from rasterio.enums import Resampling
-
+from app.application.services.dtos.planetary_all_images_response import PlanetaryAllImagesResponse
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
 from app.application.services.stac.preferred_provider import PreferredProvider
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName, resolve_band_href
+from app.core.cache_key import build_cache_key
+from app.core.config import Config
+from app.core.performance import PerformanceMetrics
 from app.core.utils.result import AppError, BadRequestError, Result
+from app.domain.ports.blob_storage_port import BlobStoragePort
+from app.domain.ports.cache_port import CachePort
 
-# Sentinel-2 SCL: cloud shadow (3), medium/high cloud (8, 9), thin cirrus (10)
+logger = logging.getLogger("app.image")
+
 SCL_CLOUD_CLASSES = frozenset({3, 8, 9, 10})
-
-# Dimensões adequadas para exibição em relatório PDF (~150 DPI em A4)
 REPORT_MAX_IMAGE_DIMENSION = 1200
 REPORT_JPEG_QUALITY = 85
-READ_RESAMPLE_FACTOR = 1
+ALL_PRODUCT_BANDS = ("B02", "B03", "B04", "B08", "B11")
 
-# Otimiza leitura de COGs remotos via HTTP (Azure Blob / vsicurl)
-RASTERIO_GDAL_CONFIG = {
-    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-    "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-    "GDAL_HTTP_MULTIPLEX": "YES",
-    "GDAL_HTTP_VERSION": "2",
-    "VSI_CACHE": "TRUE",
-    "VSI_CACHE_SIZE": "5000000",
-}
+
+def _build_rasterio_gdal_config() -> dict[str, str]:
+    return {
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+        "GDAL_HTTP_MULTIPLEX": "YES",
+        "GDAL_HTTP_VERSION": "2",
+        "VSI_CACHE": "TRUE",
+        "VSI_CACHE_SIZE": Config.VSI_CACHE_SIZE,
+    }
+
+
+def _compute_out_shape(window, max_dimension: int) -> tuple[int, int]:
+    out_height = max(1, int(window.height))
+    out_width = max(1, int(window.width))
+    max_dim = max(out_height, out_width)
+    if max_dim <= max_dimension:
+        return out_height, out_width
+    scale = max_dimension / max_dim
+    return max(1, int(out_height * scale)), max(1, int(out_width * scale))
+
+
+@dataclass
+class RasterContext:
+    window: object
+    crop_transform: object
+    image_crs: object
+    transform_affine: object
+    out_height: int
+    out_width: int
 
 
 class PlanetaryVisualImageServicePort(ABC):
@@ -74,10 +106,32 @@ class PlanetaryVisualImageServicePort(ABC):
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
+    @abstractmethod
+    async def get_all_images_by_day(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryAllImagesResponse, AppError]:
+        pass
+
 
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
-    def __init__(self, stac_facade: StacResilientFacade):
+    def __init__(
+        self,
+        stac_facade: StacResilientFacade,
+        cache_service: CachePort | None = None,
+        blob_storage: BlobStoragePort | None = None,
+    ):
         self._stac_facade = stac_facade
+        self._cache = cache_service
+        self._blob_storage = blob_storage
+        self._gdal_config = _build_rasterio_gdal_config()
+        self._interp_points = Config.IMAGE_POLYGON_INTERP_POINTS
+        self._border_width = Config.IMAGE_POLYGON_BORDER_WIDTH
+        self._enable_sharpen = Config.IMAGE_ENABLE_SHARPEN
 
     async def get_ndmi_image(
         self,
@@ -87,48 +141,62 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
+        metrics = PerformanceMetrics(context="ndmi")
+        cache_key = build_cache_key(
+            "ndmi",
+            day=day,
+            geometry=geometry,
+            cloud_percentual=cloud_percentual,
+            generate_image=generate_image,
+            preferred_provider=preferred_provider,
+        )
+        cached = await self._try_get_cached_ndvi(cache_key)
+        if cached is not None:
+            return Result.Ok(cached)
+
         try:
-            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
-            selected, provider = await self._search_selected_item(
-                day=day,
-                cloud_percentual=cloud_percentual,
-                geom=geom,
-                geojson_geom=geojson_geom,
-                preferred_provider=preferred_provider,
-            )
+            with metrics.span("prepare_context"):
+                selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
+                    day, cloud_percentual, geometry, preferred_provider, metrics
+                )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-            try:
-                assets = self._get_ndmi_assets(selected)
-            except KeyError as e:
-                return Result.Err(BadRequestError(f"Asset NDMI {e} não disponível na imagem selecionada."))
-            geometry_cloud_percentual = await asyncio.to_thread(
-                self._compute_cloud_percentual_over_geometry,
-                selected, geom, geom_bounds, provider,
-            )
-            cloud_error = self._validate_geometry_cloud_percentual(
-                geometry_cloud_percentual, cloud_percentual
-            )
-            if cloud_error is not None:
-                return Result.Err(cloud_error)
-            image, ndmi_mean, ndmi_min, ndmi_max = await asyncio.to_thread(
-                self._download_crop_ndmi_image,
-                assets, geom_bounds, geom, generate_image, provider,
-            )
-            return Result.Ok(PlanetaryNdviImageResponse(
+
+            with metrics.span("bands_read"):
+                jpeg_bytes, ndmi_mean, ndmi_min, ndmi_max = await asyncio.to_thread(
+                    self._process_ndmi_from_item,
+                    selected,
+                    geom_bounds,
+                    geom,
+                    generate_image,
+                    provider,
+                )
+
+            image_url = None
+            if generate_image and jpeg_bytes is not None:
+                with metrics.span("blob_upload"):
+                    image_url = await self._upload_jpeg(
+                        jpeg_bytes,
+                        f"sentinel/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
+                    )
+
+            response = PlanetaryNdviImageResponse(
                 day=day,
                 cloud_percentual=geometry_cloud_percentual,
-                base64image=image,
+                image_url=image_url,
                 ndvi_mean=ndmi_mean,
                 ndvi_min=ndmi_min,
                 ndvi_max=ndmi_max,
-                sat_image_id=selected.id
-            ))
+                sat_image_id=selected.id,
+            )
+            await self._set_cached_ndvi(cache_key, response)
+            metrics.log_summary()
+            return Result.Ok(response)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagem NDMI: {str(ex)}")
-    
+
     async def get_visual_image(
         self,
         day: date,
@@ -136,41 +204,49 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geometry: str,
         preferred_provider: PreferredProvider | None = None,
     ) -> Result[PlanetaryImageVisualResponse, AppError]:
+        metrics = PerformanceMetrics(context="visual")
+        cache_key = build_cache_key(
+            "visual",
+            day=day,
+            geometry=geometry,
+            cloud_percentual=cloud_percentual,
+            preferred_provider=preferred_provider,
+        )
+        cached = await self._try_get_cached_visual(cache_key)
+        if cached is not None:
+            return Result.Ok(cached)
+
         try:
-            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
-            selected, provider = await self._search_selected_item(
-                day=day,
-                cloud_percentual=cloud_percentual,
-                geom=geom,
-                geojson_geom=geojson_geom,
-                preferred_provider=preferred_provider,
-            )
+            with metrics.span("prepare_context"):
+                selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
+                    day, cloud_percentual, geometry, preferred_provider, metrics
+                )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-            try:
-                assets = self._get_rgb_assets(selected)
-            except KeyError as e:
-                return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
-            geometry_cloud_percentual = await asyncio.to_thread(
-                self._compute_cloud_percentual_over_geometry,
-                selected, geom, geom_bounds, provider,
-            )
-            cloud_error = self._validate_geometry_cloud_percentual(
-                geometry_cloud_percentual, cloud_percentual
-            )
-            if cloud_error is not None:
-                return Result.Err(cloud_error)
-            image = await asyncio.to_thread(
-                self._download_crop_rgb_image,
-                assets, geom_bounds, geom, provider,
-            )
 
-            return Result.Ok(PlanetaryImageVisualResponse(
+            with metrics.span("bands_read"):
+                jpeg_bytes = await asyncio.to_thread(
+                    self._process_rgb_from_item,
+                    selected,
+                    geom_bounds,
+                    geom,
+                    provider,
+                )
+
+            with metrics.span("blob_upload"):
+                image_url = await self._upload_jpeg(
+                    jpeg_bytes,
+                    f"sentinel/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
+                )
+
+            response = PlanetaryImageVisualResponse(
                 day=day,
                 cloud_percentual=geometry_cloud_percentual,
-                base64image=image
-            ))
-
+                image_url=image_url,
+            )
+            await self._set_cached_visual(cache_key, response)
+            metrics.log_summary()
+            return Result.Ok(response)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
@@ -184,8 +260,165 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
+        metrics = PerformanceMetrics(context="ndvi")
+        cache_key = build_cache_key(
+            "ndvi",
+            day=day,
+            geometry=geometry,
+            cloud_percentual=cloud_percentual,
+            generate_image=generate_image,
+            preferred_provider=preferred_provider,
+        )
+        cached = await self._try_get_cached_ndvi(cache_key)
+        if cached is not None:
+            return Result.Ok(cached)
+
         try:
-            geom, geojson_geom, geom_bounds = self.map_geom(geometry)
+            with metrics.span("prepare_context"):
+                selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
+                    day, cloud_percentual, geometry, preferred_provider, metrics
+                )
+            if selected is None:
+                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
+
+            with metrics.span("bands_read"):
+                jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
+                    self._process_ndvi_from_item,
+                    selected,
+                    geom_bounds,
+                    geom,
+                    generate_image,
+                    provider,
+                )
+
+            image_url = None
+            if generate_image and jpeg_bytes is not None:
+                with metrics.span("blob_upload"):
+                    image_url = await self._upload_jpeg(
+                        jpeg_bytes,
+                        f"sentinel/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
+                    )
+
+            response = PlanetaryNdviImageResponse(
+                day=day,
+                cloud_percentual=geometry_cloud_percentual,
+                image_url=image_url,
+                ndvi_mean=ndvi_mean,
+                ndvi_min=ndvi_min,
+                ndvi_max=ndvi_max,
+                sat_image_id=selected.id,
+            )
+            await self._set_cached_ndvi(cache_key, response)
+            metrics.log_summary()
+            return Result.Ok(response)
+        except ValueError as ex:
+            return Result.Err(str(ex))
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
+
+    async def get_all_images_by_day(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+    ) -> Result[PlanetaryAllImagesResponse, AppError]:
+        metrics = PerformanceMetrics(context="all")
+        cache_key = build_cache_key(
+            "all",
+            day=day,
+            geometry=geometry,
+            cloud_percentual=cloud_percentual,
+            generate_image=generate_image,
+            preferred_provider=preferred_provider,
+        )
+        cached = await self._try_get_cached_all(cache_key)
+        if cached is not None:
+            return Result.Ok(cached)
+
+        try:
+            with metrics.span("prepare_context"):
+                selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
+                    day, cloud_percentual, geometry, preferred_provider, metrics
+                )
+            if selected is None:
+                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
+
+            with metrics.span("bands_read"):
+                pipeline_result = await asyncio.to_thread(
+                    self._process_all_from_item,
+                    selected,
+                    geom_bounds,
+                    geom,
+                    generate_image,
+                    provider,
+                )
+
+            visual_jpeg, ndvi_jpeg, ndmi_jpeg, ndvi_stats, ndmi_stats = pipeline_result
+
+            with metrics.span("blob_upload"):
+                visual_url = await self._upload_jpeg(
+                    visual_jpeg,
+                    f"sentinel/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
+                )
+                ndvi_url = None
+                ndmi_url = None
+                if generate_image:
+                    if ndvi_jpeg is not None:
+                        ndvi_url = await self._upload_jpeg(
+                            ndvi_jpeg,
+                            f"sentinel/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
+                        )
+                    if ndmi_jpeg is not None:
+                        ndmi_url = await self._upload_jpeg(
+                            ndmi_jpeg,
+                            f"sentinel/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
+                        )
+
+            response = PlanetaryAllImagesResponse(
+                visual=PlanetaryImageVisualResponse(
+                    day=day,
+                    cloud_percentual=geometry_cloud_percentual,
+                    image_url=visual_url,
+                ),
+                ndvi=PlanetaryNdviImageResponse(
+                    day=day,
+                    cloud_percentual=geometry_cloud_percentual,
+                    image_url=ndvi_url,
+                    ndvi_mean=ndvi_stats[0],
+                    ndvi_min=ndvi_stats[1],
+                    ndvi_max=ndvi_stats[2],
+                    sat_image_id=selected.id,
+                ),
+                ndmi=PlanetaryNdviImageResponse(
+                    day=day,
+                    cloud_percentual=geometry_cloud_percentual,
+                    image_url=ndmi_url,
+                    ndvi_mean=ndmi_stats[0],
+                    ndvi_min=ndmi_stats[1],
+                    ndvi_max=ndmi_stats[2],
+                    sat_image_id=selected.id,
+                ),
+            )
+            await self._set_cached_all(cache_key, response)
+            metrics.log_summary()
+            return Result.Ok(response)
+        except ValueError as ex:
+            return Result.Err(str(ex))
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar imagens: {str(ex)}")
+
+    async def _prepare_context(
+        self,
+        day: date,
+        cloud_percentual: float,
+        geometry: str,
+        preferred_provider: PreferredProvider | None,
+        metrics: PerformanceMetrics,
+    ) -> tuple[pystac.Item | None, StacProviderName, BaseGeometry, tuple, float]:
+        geom, geojson_geom, geom_bounds = self.map_geom(geometry)
+        with metrics.span("stac_search"):
             selected, provider = await self._search_selected_item(
                 day=day,
                 cloud_percentual=cloud_percentual,
@@ -193,38 +426,25 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 geojson_geom=geojson_geom,
                 preferred_provider=preferred_provider,
             )
-            if selected is None:
-                return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
-            try:
-                assets = self._get_ndvi_assets(selected)
-            except KeyError as e:
-                return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
+        if selected is None:
+            return None, provider, geom, geom_bounds, 0.0
+
+        with metrics.span("scl_read"):
             geometry_cloud_percentual = await asyncio.to_thread(
                 self._compute_cloud_percentual_over_geometry,
-                selected, geom, geom_bounds, provider,
+                selected,
+                geom,
+                geom_bounds,
+                provider,
             )
-            cloud_error = self._validate_geometry_cloud_percentual(
-                geometry_cloud_percentual, cloud_percentual
-            )
-            if cloud_error is not None:
-                return Result.Err(cloud_error)
-            image, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
-                self._download_crop_ndvi_image,
-                assets, geom_bounds, geom, generate_image, provider,
-            )
-            return Result.Ok(PlanetaryNdviImageResponse(
-                day=day,
-                cloud_percentual=geometry_cloud_percentual,
-                base64image=image,
-                ndvi_mean=ndvi_mean,
-                ndvi_min=ndvi_min,
-                ndvi_max=ndvi_max,
-                sat_image_id=selected.id
-            ))
-        except ValueError as ex:
-            return Result.Err(str(ex))
-        except Exception as ex:
-            return Result.Err(f"Erro inesperado ao buscar imagem NDVI: {str(ex)}")
+        cloud_error = self._validate_geometry_cloud_percentual(
+            geometry_cloud_percentual,
+            cloud_percentual,
+        )
+        if cloud_error is not None:
+            raise ValueError(str(cloud_error))
+
+        return selected, provider, geom, geom_bounds, geometry_cloud_percentual
 
     async def _search_selected_item(
         self,
@@ -260,21 +480,28 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom_bounds: tuple,
         provider: StacProviderName,
     ) -> float:
-        from rasterio.features import geometry_mask
-
         try:
             scl_href = self._sign_url(resolve_band_href(item, "SCL"), provider)
         except KeyError:
             return float(item.properties.get("eo:cloud_cover", 0.0))
 
-        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
+        with rasterio.Env(**self._gdal_config):
             with rasterio.open(scl_href) as src:
                 image_crs = src.crs
                 geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
                 window = from_bounds(*geom_bounds_proj, transform=src.transform)
                 window = window.round_offsets().round_lengths()
-                scl = src.read(1, window=window)
+                scl_out_shape = _compute_out_shape(window, Config.SCL_MAX_DIMENSION)
+                scl = src.read(
+                    1,
+                    window=window,
+                    out_shape=scl_out_shape,
+                    resampling=Resampling.average,
+                )
                 crop_transform = src.window_transform(window)
+                scale_x = window.width / scl_out_shape[1]
+                scale_y = window.height / scl_out_shape[0]
+                crop_transform = crop_transform * crop_transform.scale(scale_x, scale_y)
 
         project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
         geom_proj = shapely_transform(project, geom)
@@ -298,6 +525,252 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             )
         return None
 
+    def _read_shared_bands(
+        self,
+        item: pystac.Item,
+        geom_bounds: tuple,
+        provider: StacProviderName,
+        band_keys: tuple[str, ...],
+    ) -> tuple[dict[str, np.ndarray], RasterContext]:
+        reference_href = self._sign_url(resolve_band_href(item, "B04"), provider)
+        with rasterio.Env(**self._gdal_config):
+            with rasterio.open(reference_href) as ref_src:
+                image_crs = ref_src.crs
+                transform_affine = ref_src.transform
+                geom_bounds_proj = transform_bounds("EPSG:4326", ref_src.crs, *geom_bounds)
+                window = from_bounds(*geom_bounds_proj, transform=ref_src.transform)
+                window = window.round_offsets().round_lengths()
+                out_height, out_width = _compute_out_shape(window, REPORT_MAX_IMAGE_DIMENSION)
+                crop_transform = ref_src.window_transform(window)
+                scale_x = window.width / out_width
+                scale_y = window.height / out_height
+                crop_transform = crop_transform * crop_transform.scale(scale_x, scale_y)
+
+        bands: dict[str, np.ndarray] = {}
+        resampling = Resampling.bilinear
+        out_shape = (out_height, out_width)
+        ctx = RasterContext(
+            window=window,
+            crop_transform=crop_transform,
+            image_crs=image_crs,
+            transform_affine=transform_affine,
+            out_height=out_height,
+            out_width=out_width,
+        )
+
+        with rasterio.Env(**self._gdal_config):
+            for band_key in band_keys:
+                href = self._sign_url(resolve_band_href(item, band_key), provider)
+                with rasterio.open(href) as src:
+                    bands[band_key] = src.read(
+                        1,
+                        window=window,
+                        out_shape=out_shape,
+                        resampling=resampling,
+                    ).astype(np.float32)
+
+        return bands, ctx
+
+    def _process_rgb_from_item(
+        self,
+        item: pystac.Item,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        provider: StacProviderName,
+    ) -> bytes:
+        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B02", "B03", "B04"))
+        b02 = np.clip(bands["B02"], 0, 3000)
+        b03 = np.clip(bands["B03"], 0, 3000)
+        b04 = np.clip(bands["B04"], 0, 3000)
+        image_rgb = np.stack(
+            [
+                (b04 / 3000 * 255).astype(np.uint8),
+                (b03 / 3000 * 255).astype(np.uint8),
+                (b02 / 3000 * 255).astype(np.uint8),
+            ],
+            axis=-1,
+        )
+        pil_img = Image.fromarray(image_rgb)
+        return self._finalize_image_bytes(pil_img, geom, ctx)
+
+    def _process_ndvi_from_item(
+        self,
+        item: pystac.Item,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        generate_image: bool,
+        provider: StacProviderName,
+    ) -> tuple[bytes | None, float | None, float | None, float | None]:
+        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B04", "B08"))
+        return self._build_index_product(
+            bands["B08"],
+            bands["B04"],
+            geom,
+            ctx,
+            generate_image,
+            NDVI_BANDWIDTH_COLORS_VALUES,
+            BANDWIDTH_COLORS_NDVI,
+            is_ndvi=True,
+        )
+
+    def _process_ndmi_from_item(
+        self,
+        item: pystac.Item,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        generate_image: bool,
+        provider: StacProviderName,
+    ) -> tuple[bytes | None, float | None, float | None, float | None]:
+        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B08", "B11"))
+        return self._build_index_product(
+            bands["B08"],
+            bands["B11"],
+            geom,
+            ctx,
+            generate_image,
+            NDMI_BANDWIDTH_COLORS_VALUES,
+            NDMI_BANDWIDTH_COLORS,
+            is_ndvi=False,
+        )
+
+    def _process_all_from_item(
+        self,
+        item: pystac.Item,
+        geom_bounds: tuple,
+        geom: BaseGeometry,
+        generate_image: bool,
+        provider: StacProviderName,
+    ) -> tuple[bytes, bytes | None, bytes | None, tuple, tuple]:
+        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ALL_PRODUCT_BANDS)
+
+        b02 = np.clip(bands["B02"], 0, 3000)
+        b03 = np.clip(bands["B03"], 0, 3000)
+        b04 = np.clip(bands["B04"], 0, 3000)
+        image_rgb = np.stack(
+            [
+                (b04 / 3000 * 255).astype(np.uint8),
+                (b03 / 3000 * 255).astype(np.uint8),
+                (b02 / 3000 * 255).astype(np.uint8),
+            ],
+            axis=-1,
+        )
+        visual_jpeg = self._finalize_image_bytes(Image.fromarray(image_rgb), geom, ctx)
+
+        ndvi_jpeg, ndvi_mean, ndvi_min, ndvi_max = self._build_index_product(
+            bands["B08"],
+            bands["B04"],
+            geom,
+            ctx,
+            generate_image,
+            NDVI_BANDWIDTH_COLORS_VALUES,
+            BANDWIDTH_COLORS_NDVI,
+            is_ndvi=True,
+        )
+        ndmi_jpeg, ndmi_mean, ndmi_min, ndmi_max = self._build_index_product(
+            bands["B08"],
+            bands["B11"],
+            geom,
+            ctx,
+            generate_image,
+            NDMI_BANDWIDTH_COLORS_VALUES,
+            NDMI_BANDWIDTH_COLORS,
+            is_ndvi=False,
+        )
+
+        return (
+            visual_jpeg,
+            ndvi_jpeg,
+            ndmi_jpeg,
+            (ndvi_mean, ndvi_min, ndvi_max),
+            (ndmi_mean, ndmi_min, ndmi_max),
+        )
+
+    def _build_index_product(
+        self,
+        numerator_band: np.ndarray,
+        denominator_band: np.ndarray,
+        geom: BaseGeometry,
+        ctx: RasterContext,
+        generate_image: bool,
+        color_values: list[float],
+        color_palette: list[tuple[float, float, float]],
+        is_ndvi: bool,
+    ) -> tuple[bytes | None, float | None, float | None, float | None]:
+        if is_ndvi:
+            index = (numerator_band - denominator_band) / (numerator_band + denominator_band + 1e-6)
+        else:
+            index = (numerator_band - denominator_band) / (numerator_band + denominator_band + 1e-6)
+        index = np.clip(index, -1, 1)
+
+        project = pyproj.Transformer.from_crs("EPSG:4326", ctx.image_crs, always_xy=True).transform
+        geom_proj = shapely_transform(project, geom)
+        mask = geometry_mask(
+            [mapping(geom_proj)],
+            out_shape=index.shape,
+            transform=ctx.crop_transform,
+            invert=True,
+        )
+        index_inside = index[mask]
+        index_inside = index_inside[~np.isnan(index_inside) & ~np.isinf(index_inside)]
+        if index_inside.size > 0:
+            index_mean = float(np.mean(index_inside))
+            index_min = float(np.min(index_inside))
+            index_max = float(np.max(index_inside))
+        else:
+            index_mean = index_min = index_max = None
+
+        if not generate_image:
+            return None, index_mean, index_min, index_max
+
+        rgb = self._apply_colormap(index, color_values, color_palette)
+        pil_img = Image.fromarray(rgb, mode="RGB")
+        jpeg_bytes = self._finalize_image_bytes(pil_img, geom, ctx)
+        return jpeg_bytes, index_mean, index_min, index_max
+
+    def _apply_colormap(
+        self,
+        index: np.ndarray,
+        color_values: list[float],
+        color_palette: list[tuple[float, float, float]],
+    ) -> np.ndarray:
+        rgb = np.zeros(index.shape + (3,), dtype=np.float32)
+        flat_index = index.ravel()
+        flat_rgb = rgb.reshape(-1, 3)
+        bins = np.searchsorted(color_values, flat_index, side="right") - 1
+        bins = np.clip(bins, 0, len(color_values) - 2)
+        for i in range(len(color_values) - 1):
+            mask = bins == i
+            if not np.any(mask):
+                continue
+            vmin = color_values[i]
+            vmax = color_values[i + 1]
+            cmin = np.array(color_palette[i])
+            cmax = np.array(color_palette[i + 1])
+            alpha = (flat_index[mask] - vmin) / (vmax - vmin + 1e-8)
+            flat_rgb[mask] = (1 - alpha)[:, None] * cmin + alpha[:, None] * cmax
+        return (rgb * 255).astype(np.uint8)
+
+    def _finalize_image_bytes(
+        self,
+        pil_img: Image.Image,
+        geom: BaseGeometry,
+        ctx: RasterContext,
+    ) -> bytes:
+        if self._enable_sharpen:
+            pil_img = pil_img.filter(ImageFilter.SHARPEN)
+        pil_img = self._draw_smooth_polygon_on_image(
+            pil_img,
+            geom,
+            ctx.image_crs,
+            ctx.transform_affine,
+            ctx.window,
+            color="white",
+            width=self._border_width,
+            interp_points=self._interp_points,
+        )
+        pil_img = self._prepare_image_for_report(pil_img)
+        return self._pil_image_to_jpeg_bytes(pil_img)
+
     def _prepare_image_for_report(self, pil_img: Image.Image) -> Image.Image:
         width, height = pil_img.size
         max_dim = max(width, height)
@@ -314,204 +787,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
     def _sign_url(self, href: str, provider: StacProviderName) -> str:
         return self._stac_facade.sign_asset_url(href, provider)
-
-    def _download_crop_ndmi_image(
-        self,
-        band_hrefs: dict,
-        geom_bounds: tuple,
-        geom: BaseGeometry,
-        generate_image: bool,
-        provider: StacProviderName,
-    ):
-        from PIL import ImageFilter, Image
-        # 1. Abra a SWIR (B11) primeiro para referência de resolução
-        swir_href = self._sign_url(band_hrefs["B11"], provider)
-        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
-            with rasterio.open(swir_href) as swir_src:
-                image_crs = swir_src.crs
-                transform_affine = swir_src.transform
-                geom_bounds_proj = transform_bounds("EPSG:4326", swir_src.crs, *geom_bounds)
-                window = from_bounds(*geom_bounds_proj, transform=swir_src.transform)
-                window = window.round_offsets().round_lengths()
-                upscale_factor = READ_RESAMPLE_FACTOR
-                out_height = max(1, int(window.height * upscale_factor))
-                out_width = max(1, int(window.width * upscale_factor))
-                crop_transform = swir_src.window_transform(window)
-                crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
-                resampling = Resampling.lanczos if upscale_factor != 1 else Resampling.nearest
-                swir = swir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
-        # 2. Abra a NIR (B08) e reamostre para shape da SWIR
-        nir_href = self._sign_url(band_hrefs["B08"], provider)
-        with rasterio.Env(**RASTERIO_GDAL_CONFIG):
-            with rasterio.open(nir_href) as nir_src:
-                nir = nir_src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
-        # NDMI calculation
-        ndmi = (nir - swir) / (nir + swir + 1e-6)
-        ndmi = np.clip(ndmi, -1, 1)
-
-        # Calcular estatísticas apenas dentro do polígono original (geom)
-        from rasterio.features import geometry_mask
-        project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
-        geom_proj = shapely_transform(project, geom)
-        mask = geometry_mask([mapping(geom_proj)], out_shape=ndmi.shape, transform=crop_transform, invert=True)
-        ndmi_inside = ndmi[mask]
-        ndmi_inside = ndmi_inside[~np.isnan(ndmi_inside) & ~np.isinf(ndmi_inside)]
-        if ndmi_inside.size > 0:
-            ndmi_mean = float(np.mean(ndmi_inside))
-            ndmi_min = float(np.min(ndmi_inside))
-            ndmi_max = float(np.max(ndmi_inside))
-        else:
-            ndmi_mean = ndmi_min = ndmi_max = None
-
-        if not generate_image:
-            return None, ndmi_mean, ndmi_min, ndmi_max
-
-        # Aplicar colormap NDMI customizado
-        ndmi_rgb = np.zeros(ndmi.shape + (3,), dtype=np.float32)
-        for i in range(len(NDMI_BANDWIDTH_COLORS_VALUES) - 1):
-            vmin = NDMI_BANDWIDTH_COLORS_VALUES[i]
-            vmax = NDMI_BANDWIDTH_COLORS_VALUES[i + 1]
-            cmin = np.array(NDMI_BANDWIDTH_COLORS[i])
-            cmax = np.array(NDMI_BANDWIDTH_COLORS[i + 1])
-            mask = (ndmi >= vmin) & (ndmi <= vmax)
-            if np.any(mask):
-                alpha = (ndmi[mask] - vmin) / (vmax - vmin + 1e-8)
-                ndmi_rgb[mask] = (1 - alpha)[:, None] * cmin + alpha[:, None] * cmax
-
-        ndmi_rgb = (ndmi_rgb * 255).astype(np.uint8)
-        pil_img = Image.fromarray(ndmi_rgb, mode="RGB")
-        pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
-        pil_img = self._prepare_image_for_report(pil_img)
-        return self._pil_image_to_base64(pil_img), ndmi_mean, ndmi_min, ndmi_max
-    
-    def _download_crop_ndvi_image(
-        self,
-        band_hrefs: dict,
-        geom_bounds: tuple,
-        geom: BaseGeometry,
-        generate_image: bool,
-        provider: StacProviderName,
-    ):
-        from PIL import ImageFilter, Image
-        bands_data = []
-        transform_affine = None
-        image_crs = None
-        window = None
-        upscale_factor = READ_RESAMPLE_FACTOR
-        crop_transform = None
-        for band_idx, band_name in enumerate(["red", "nir"]):
-            band_asset_key = {"red": "B04", "nir": "B08"}[band_name]
-            href = band_hrefs[band_asset_key]
-            href = self._sign_url(href, provider)
-            with rasterio.Env(**RASTERIO_GDAL_CONFIG):
-                with rasterio.open(href) as src:
-                    if band_idx == 0:
-                        image_crs = src.crs
-                        transform_affine = src.transform
-                        geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
-                        window = from_bounds(*geom_bounds_proj, transform=src.transform)
-                        window = window.round_offsets().round_lengths()
-                        out_height = max(1, int(window.height * upscale_factor))
-                        out_width = max(1, int(window.width * upscale_factor))
-                        crop_transform = src.window_transform(window)
-                        crop_transform = crop_transform * crop_transform.scale(1/upscale_factor, 1/upscale_factor)
-                    resampling = Resampling.lanczos if upscale_factor != 1 else Resampling.nearest
-                    band = src.read(1, window=window, out_shape=(out_height, out_width), resampling=resampling).astype(np.float32)
-                    bands_data.append(band)
-        red = bands_data[0]
-        nir = bands_data[1]
-        # NDVI calculation
-        ndvi = (nir - red) / (nir + red + 1e-6)
-        ndvi = np.clip(ndvi, -1, 1)
-
-        # Calcular estatísticas apenas dentro do polígono original (geom)
-        from rasterio.features import geometry_mask
-        project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
-        geom_proj = shapely_transform(project, geom)
-        mask = geometry_mask([mapping(geom_proj)], out_shape=ndvi.shape, transform=crop_transform, invert=True)
-        ndvi_inside = ndvi[mask]
-        ndvi_inside = ndvi_inside[~np.isnan(ndvi_inside) & ~np.isinf(ndvi_inside)]
-        if ndvi_inside.size > 0:
-            ndvi_mean = float(np.mean(ndvi_inside))
-            ndvi_min = float(np.min(ndvi_inside))
-            ndvi_max = float(np.max(ndvi_inside))
-        else:
-            ndvi_mean = ndvi_min = ndvi_max = None
-
-        if not generate_image:
-            return None, ndvi_mean, ndvi_min, ndvi_max
-
-        # Aplicar colormap NDVI customizado
-        ndvi_rgb = np.zeros(ndvi.shape + (3,), dtype=np.float32)
-        for i in range(len(NDVI_BANDWIDTH_COLORS_VALUES) - 1):
-            vmin = NDVI_BANDWIDTH_COLORS_VALUES[i]
-            vmax = NDVI_BANDWIDTH_COLORS_VALUES[i + 1]
-            cmin = np.array(BANDWIDTH_COLORS_NDVI[i])
-            cmax = np.array(BANDWIDTH_COLORS_NDVI[i + 1])
-            mask = (ndvi >= vmin) & (ndvi <= vmax)
-            if np.any(mask):
-                # Interpolação linear de cor
-                alpha = (ndvi[mask] - vmin) / (vmax - vmin + 1e-8)
-                ndvi_rgb[mask] = (1 - alpha)[:, None] * cmin + alpha[:, None] * cmax
-
-        ndvi_rgb = (ndvi_rgb * 255).astype(np.uint8)
-        pil_img = Image.fromarray(ndvi_rgb, mode="RGB")
-        pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
-        pil_img = self._prepare_image_for_report(pil_img)
-        return self._pil_image_to_base64(pil_img), ndvi_mean, ndvi_min, ndvi_max
-        
-    def _download_crop_rgb_image(
-        self,
-        band_hrefs: dict,
-        geom_bounds: tuple,
-        geom: BaseGeometry,
-        provider: StacProviderName,
-    ) -> str:
-        from PIL import ImageFilter
-
-        bands_data = []
-        transform_affine = None
-        image_crs = None
-        window = None
-        upscale_factor = READ_RESAMPLE_FACTOR
-
-        for band_idx, band_name in enumerate(["red", "green", "blue"]):
-            band_asset_key = {"red": "B04", "green": "B03", "blue": "B02"}[band_name]
-            href = band_hrefs[band_asset_key]
-            href = self._sign_url(href, provider)
-
-            with rasterio.Env(**RASTERIO_GDAL_CONFIG):
-                with rasterio.open(href) as src:
-                    if band_idx == 0:
-                        image_crs = src.crs
-                        transform_affine = src.transform
-                        geom_bounds_proj = transform_bounds("EPSG:4326", src.crs, *geom_bounds)
-                        window = from_bounds(*geom_bounds_proj, transform=src.transform)
-                        window = window.round_offsets().round_lengths()
-                        out_height = max(1, int(window.height * upscale_factor))
-                        out_width = max(1, int(window.width * upscale_factor))
-
-                    band = src.read(
-                        1,
-                        window=window,
-                        out_shape=(out_height, out_width),
-                        resampling=Resampling.lanczos if upscale_factor != 1 else Resampling.nearest,
-                    )
-                    # Conversão direta para uint8 usando divisor fixo (ex: 3000)
-                    band = np.clip(band, 0, 3000)
-                    band = (band / 3000 * 255).astype(np.uint8)
-                    bands_data.append(band)
-
-        image_rgb = np.stack(bands_data, axis=-1)
-        pil_img = Image.fromarray(image_rgb)
-
-        # 3. (Opcional: Sharpening pode ser mantido ou removido, aqui mantido para leve nitidez)
-        pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        pil_img = self._draw_smooth_polygon_on_image(pil_img, geom, image_crs, transform_affine, window, color="white", width=3)
-        pil_img = self._prepare_image_for_report(pil_img)
-        return self._pil_image_to_base64(pil_img)
 
     def _extract_boundary_lines(self, geom_proj):
         from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
@@ -533,25 +808,27 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         raise ValueError(f"Unsupported geometry type for drawing: {geom_proj.geom_type}")
 
-    def _draw_smooth_polygon_on_image(self, pil_img, geom, image_crs, transform_affine, window, color="white", width=5, interp_points=200):
-        """
-        Desenha um polígono suavizado (interpolado) sobre a imagem PIL.
-        interp_points: número de pontos interpolados para suavizar a linha.
-        Considera o upscale da imagem para desenhar o polígono no local correto.
-        """
+    def _draw_smooth_polygon_on_image(
+        self,
+        pil_img,
+        geom,
+        image_crs,
+        transform_affine,
+        window,
+        color="white",
+        width=5,
+        interp_points=80,
+    ):
         draw = ImageDraw.Draw(pil_img)
-        # Transforma geom para o CRS da imagem
         project = pyproj.Transformer.from_crs("EPSG:4326", image_crs, always_xy=True).transform
         geom_proj = shapely_transform(project, geom)
 
-        def world_to_pixel(x, y, transform_affine, window):
-            col, row = ~transform_affine * (x, y)
-            return (col - window.col_off, row - window.row_off)
+        def world_to_pixel(x, y, transform, win):
+            col, row = ~transform * (x, y)
+            return (col - win.col_off, row - win.row_off)
 
         boundary_lines = self._extract_boundary_lines(geom_proj)
 
-        # Calcular fator de escala real
-        # O window.height/width é o tamanho "original" do crop, pil_img.size é o tamanho real após upscale
         if window is not None:
             orig_height = window.height
             orig_width = window.width
@@ -577,42 +854,24 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 px *= scale_x
                 py *= scale_y
                 pixel_coords.append((px, py))
-            # Fecha o polígono
             pixel_coords.append(pixel_coords[0])
             draw.line(pixel_coords, fill=color, width=width, joint="curve")
 
         return pil_img
 
-    def _pil_image_to_base64(self, pil_img: Image.Image) -> str:
-        """
-        Converte uma imagem PIL para base64.
-        """
-        import base64
-        from io import BytesIO
-
+    def _pil_image_to_jpeg_bytes(self, pil_img: Image.Image) -> bytes:
         buffered = BytesIO()
-        pil_img.save(buffered, format="JPEG", quality=REPORT_JPEG_QUALITY, optimize=True)
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        return img_str
-    
-    def _get_rgb_assets(self, item: pystac.Item) -> dict:
-        return {
-            "B04": resolve_band_href(item, "B04"),
-            "B03": resolve_band_href(item, "B03"),
-            "B02": resolve_band_href(item, "B02"),
-        }
+        pil_img.save(buffered, format="JPEG", quality=REPORT_JPEG_QUALITY, optimize=False)
+        return buffered.getvalue()
 
-    def _get_ndvi_assets(self, item: pystac.Item) -> dict:
-        return {
-            "B04": resolve_band_href(item, "B04"),
-            "B08": resolve_band_href(item, "B08"),
-        }
-
-    def _get_ndmi_assets(self, item: pystac.Item) -> dict:
-        return {
-            "B08": resolve_band_href(item, "B08"),
-            "B11": resolve_band_href(item, "B11"),
-        }
+    async def _upload_jpeg(self, jpeg_bytes: bytes | None, blob_name: str) -> str:
+        if jpeg_bytes is None:
+            raise BadRequestError("Imagem não gerada.")
+        if self._blob_storage is None:
+            raise BadRequestError(
+                "Azure Blob Storage não configurado. Defina AZURE_BLOB_CONNECTION_STRING."
+            )
+        return await self._blob_storage.upload_image_and_get_url(jpeg_bytes, blob_name)
 
     def map_geom(self, geometry):
         geom = wkt.loads(geometry)
@@ -624,13 +883,134 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         square_parameter = 2
         center_x = (minx + maxx) / square_parameter
         center_y = (miny + maxy) / square_parameter
-        square_geom = box(center_x - size / square_parameter, center_y - size / square_parameter, center_x + size / square_parameter, center_y + size / square_parameter)
+        square_geom = box(
+            center_x - size / square_parameter,
+            center_y - size / square_parameter,
+            center_x + size / square_parameter,
+            center_y + size / square_parameter,
+        )
         geojson_geom = mapping(square_geom)
-        buffer = 0.003  # graus
+        buffer = 0.003
         geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-        minx, miny, maxx, maxy = square_geom.bounds
-        return geom,geojson_geom,geom_bounds
-# NDVI colormap
+        return geom, geojson_geom, geom_bounds
+
+    async def _try_get_cached_visual(self, key: str) -> PlanetaryImageVisualResponse | None:
+        if self._cache is None:
+            return None
+        raw = await self._cache.get(key)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return PlanetaryImageVisualResponse(
+            day=date.fromisoformat(data["day"]),
+            cloud_percentual=data["cloud_percentual"],
+            image_url=data["image_url"],
+        )
+
+    async def _set_cached_visual(self, key: str, response: PlanetaryImageVisualResponse) -> None:
+        if self._cache is None:
+            return
+        payload = json.dumps(
+            {
+                "day": response.day.isoformat(),
+                "cloud_percentual": response.cloud_percentual,
+                "image_url": response.image_url,
+            }
+        )
+        await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
+    async def _try_get_cached_ndvi(self, key: str) -> PlanetaryNdviImageResponse | None:
+        if self._cache is None:
+            return None
+        raw = await self._cache.get(key)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return PlanetaryNdviImageResponse(
+            day=date.fromisoformat(data["day"]),
+            cloud_percentual=data["cloud_percentual"],
+            image_url=data.get("image_url"),
+            ndvi_mean=data.get("ndvi_mean"),
+            ndvi_min=data.get("ndvi_min"),
+            ndvi_max=data.get("ndvi_max"),
+            sat_image_id=data["sat_image_id"],
+        )
+
+    async def _set_cached_ndvi(self, key: str, response: PlanetaryNdviImageResponse) -> None:
+        if self._cache is None:
+            return
+        payload = json.dumps(
+            {
+                "day": response.day.isoformat(),
+                "cloud_percentual": response.cloud_percentual,
+                "image_url": response.image_url,
+                "ndvi_mean": response.ndvi_mean,
+                "ndvi_min": response.ndvi_min,
+                "ndvi_max": response.ndvi_max,
+                "sat_image_id": response.sat_image_id,
+            }
+        )
+        await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
+    async def _try_get_cached_all(self, key: str) -> PlanetaryAllImagesResponse | None:
+        if self._cache is None:
+            return None
+        raw = await self._cache.get(key)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+
+        def _parse_index_block(block: dict) -> PlanetaryNdviImageResponse:
+            return PlanetaryNdviImageResponse(
+                day=date.fromisoformat(block["day"]),
+                cloud_percentual=block["cloud_percentual"],
+                image_url=block.get("image_url"),
+                ndvi_mean=block.get("ndvi_mean"),
+                ndvi_min=block.get("ndvi_min"),
+                ndvi_max=block.get("ndvi_max"),
+                sat_image_id=block["sat_image_id"],
+            )
+
+        visual = data["visual"]
+        return PlanetaryAllImagesResponse(
+            visual=PlanetaryImageVisualResponse(
+                day=date.fromisoformat(visual["day"]),
+                cloud_percentual=visual["cloud_percentual"],
+                image_url=visual["image_url"],
+            ),
+            ndvi=_parse_index_block(data["ndvi"]),
+            ndmi=_parse_index_block(data["ndmi"]),
+        )
+
+    async def _set_cached_all(self, key: str, response: PlanetaryAllImagesResponse) -> None:
+        if self._cache is None:
+            return
+
+        def _serialize_index_block(item: PlanetaryNdviImageResponse) -> dict:
+            return {
+                "day": item.day.isoformat(),
+                "cloud_percentual": item.cloud_percentual,
+                "image_url": item.image_url,
+                "ndvi_mean": item.ndvi_mean,
+                "ndvi_min": item.ndvi_min,
+                "ndvi_max": item.ndvi_max,
+                "sat_image_id": item.sat_image_id,
+            }
+
+        payload = json.dumps(
+            {
+                "visual": {
+                    "day": response.visual.day.isoformat(),
+                    "cloud_percentual": response.visual.cloud_percentual,
+                    "image_url": response.visual.image_url,
+                },
+                "ndvi": _serialize_index_block(response.ndvi),
+                "ndmi": _serialize_index_block(response.ndmi),
+            }
+        )
+        await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
+
 NDVI_BANDWIDTH_COLORS_VALUES = [
     -1.0,
     -0.506082,
@@ -640,7 +1020,7 @@ NDVI_BANDWIDTH_COLORS_VALUES = [
     0.416058,
     0.554744,
     0.73236,
-    1.0
+    1.0,
 ]
 BANDWIDTH_COLORS_NDVI = [
     (139 / 255, 3 / 255, 6 / 255),
@@ -656,15 +1036,15 @@ BANDWIDTH_COLORS_NDVI = [
 
 ZERO_DIVISOR_FIX = np.iinfo(np.uint16).max * 2
 NDMI_BANDWIDTH_COLORS = [
-    (60 / 255, 29 / 255, 18 / 255),      # rgb(60, 29, 18)
-    (109 / 255, 64 / 255, 44 / 255),     # rgb(109, 64, 44)
-    (149 / 255, 87 / 255, 61 / 255),     # rgb(149, 87, 61)
-    (207 / 255, 135 / 255, 104 / 255),   # rgb(207, 135, 104)
-    (218 / 255, 229 / 255, 237 / 255),   # rgb(218, 229, 237)
-    (94 / 255, 174 / 255, 240 / 255),    # rgb(94, 174, 240)
-    (79 / 255, 150 / 255, 235 / 255),    # rgb(79, 150, 235)
-    (52 / 255, 113 / 255, 214 / 255),    # rgb(52, 113, 214)
-    (16 / 255, 69 / 255, 185 / 255)      # rgb(16, 69, 185)
+    (60 / 255, 29 / 255, 18 / 255),
+    (109 / 255, 64 / 255, 44 / 255),
+    (149 / 255, 87 / 255, 61 / 255),
+    (207 / 255, 135 / 255, 104 / 255),
+    (218 / 255, 229 / 255, 237 / 255),
+    (94 / 255, 174 / 255, 240 / 255),
+    (79 / 255, 150 / 255, 235 / 255),
+    (52 / 255, 113 / 255, 214 / 255),
+    (16 / 255, 69 / 255, 185 / 255),
 ]
 NDMI_BANDWIDTH_COLORS_VALUES = [
     -1.0,
@@ -675,47 +1055,18 @@ NDMI_BANDWIDTH_COLORS_VALUES = [
     0.22871,
     0.462288,
     0.729928,
-    1.0
+    1.0,
 ]
 
 
 def apply_filters(index: np.ndarray) -> np.ndarray:
-    """
-    Apply filters to a NumPy array by modifying its values based on specific conditions.
-
-    Parameters:
-    -----------
-    index : ndarray
-        A NumPy array containing the data to be filtered.
-
-    Returns:
-    --------
-    ndarray
-        The filtered NumPy array with the following transformations:
-    """
     index[index > 1] = 1.0
     index[index < -1] = -1.0
     index[index == 0] = np.nan
     return index
 
+
 def calc_ndmi(b_nir: np.ndarray, b_swir: np.ndarray) -> np.ndarray | list:
-    """
-    Calculate the Normalized Difference Moisture Index (NDMI) for arrays of reflectance values.
-
-    NDMI is a measure of vegetation moisture content. It is calculated using the formula:
-    NDMI = (NIR - SWIR) / (NIR + SWIR)
-
-    Parameters:
-    b_nir (np.ndarray): An array of reflectance values in the near-infrared band.
-    b_swir (np.ndarray): An array of reflectance values in the shortwave infrared band.
-
-    Returns:
-    np.ndarray: An array of NDMI values, which range from -1 to 1.
-                - Negative values generally indicate low moisture content or bare soil.
-                - Values around 0 suggest intermediate moisture.
-                - Positive values closer to 1 indicate higher moisture content in vegetation.
-                - np.nan is being used to hide 0 values as a mask.
-    """
     if len(b_nir) == 0 or len(b_swir) == 0:
         return []
 
@@ -723,31 +1074,15 @@ def calc_ndmi(b_nir: np.ndarray, b_swir: np.ndarray) -> np.ndarray | list:
     b_swir = b_swir.astype(float)
 
     denominator = b_nir + b_swir
-    denominator[denominator == 0] = ZERO_DIVISOR_FIX  # Fixing division by zero
+    denominator[denominator == 0] = ZERO_DIVISOR_FIX
 
     with np.errstate(divide="ignore", invalid="ignore"):
         ndmi = np.where(denominator != 0, (b_nir - b_swir) / denominator, 0)
 
     return apply_filters(ndmi)
 
+
 def calc_ndvi(b_nir: np.ndarray, b_red: np.ndarray) -> np.ndarray | list:
-    """
-    Calculate the Normalized Difference Vegetation Index (NDVI) for arrays of reflectance values.
-
-    NDVI is a measure of vegetation health and density. It is calculated using the formula:
-    NDVI = (NIR - RED) / (NIR + RED)
-
-    Parameters:
-    b_nir (np.ndarray): An array of reflectance values in the near-infrared band.
-    b_red (np.ndarray): An array of reflectance values in the red band.
-
-    Returns:
-    np.ndarray: An array of NDVI values, which range from -1 to 1.
-                - Negative values generally indicate non-vegetated surfaces (e.g., water, barren land).
-                - Values around 0 suggest sparse or no vegetation.
-                - Positive values closer to 1 indicate healthy, dense vegetation.
-                - np.nan is being used to hide 0 values as a mask
-    """
     if len(b_nir) == 0 or len(b_red) == 0:
         return []
 

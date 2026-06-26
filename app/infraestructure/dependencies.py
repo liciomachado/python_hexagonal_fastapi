@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from collections.abc import AsyncGenerator
 from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +20,8 @@ from app.infraestructure.repository.api_key_repository import ApiKeyRepository
 from app.infraestructure.repository.user_repository import UserRepository
 from app.application.usecases.create_user import CreateUserUseCase
 from app.infraestructure.stac_factory import get_stac_facade
+from app.infraestructure.cache_factory import get_cache_service
+from app.infraestructure.blob_factory import get_blob_storage_service
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -39,25 +43,25 @@ def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
     planetary_image_service = PlanetaryGetOptionImagesByRangeService(stac_facade)
     return GetImagesByRangeUseCase(planetary_image_service)
 
+@lru_cache
+def _get_planetary_visual_image_service() -> PlanetaryVisualImageService:
+    return PlanetaryVisualImageService(
+        stac_facade=get_stac_facade(),
+        cache_service=get_cache_service(),
+        blob_storage=get_blob_storage_service(),
+    )
+
 def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:
-    stac_facade = get_stac_facade()
-    planetary_visual_image_service = PlanetaryVisualImageService(stac_facade)
-    return GetVisualImageByDayUseCase(planetary_visual_image_service)
+    return GetVisualImageByDayUseCase(_get_planetary_visual_image_service())
 
 def get_ndvi_image_by_day_usecase() -> GetNdviImageByDayUseCase:
-    stac_facade = get_stac_facade()
-    planetary_visual_image_service = PlanetaryVisualImageService(stac_facade)
-    return GetNdviImageByDayUseCase(planetary_visual_image_service)
+    return GetNdviImageByDayUseCase(_get_planetary_visual_image_service())
 
 def get_ndmi_image_by_day_usecase() -> GetNdmiImageByDayUseCase:
-    stac_facade = get_stac_facade()
-    planetary_visual_image_service = PlanetaryVisualImageService(stac_facade)
-    return GetNdmiImageByDayUseCase(planetary_visual_image_service)
+    return GetNdmiImageByDayUseCase(_get_planetary_visual_image_service())
 
 def get_all_images_by_day_usecase() -> GetAllImagesByDayUseCase:
-    stac_facade = get_stac_facade()
-    planetary_visual_image_service = PlanetaryVisualImageService(stac_facade)
-    return GetAllImagesByDayUseCase(planetary_visual_image_service)
+    return GetAllImagesByDayUseCase(_get_planetary_visual_image_service())
 
 def get_planetary_health_check_usecase() -> CheckPlanetaryComputerHealthUseCase:
     stac_facade = get_stac_facade()

@@ -17,7 +17,7 @@ class GetNdmiImageByDayRequest(BaseModel):
 class GetNdmiImageByDayResponse(BaseModel):
     day: date
     cloud_percentual: float
-    base64image: str | None
+    image_url: str | None
     ndmi_mean: float | None
     ndmi_min: float | None
     ndmi_max: float | None
@@ -42,7 +42,7 @@ class GetNdmiImageByDayUseCase:
         return Result.Ok(GetNdmiImageByDayResponse(
             day=response.day,
             cloud_percentual=response.cloud_percentual,
-            base64image=response.base64image,
+            image_url=response.image_url,
             ndmi_mean=response.ndvi_mean,
             ndmi_min=response.ndvi_min,
             ndmi_max=response.ndvi_max,

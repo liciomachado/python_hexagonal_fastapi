@@ -7,8 +7,9 @@ setup_logging()
 from app.api.middleware.request_logging import RequestLoggingMiddleware
 from app.api.user_routes import user_router
 from app.api.sentinel_routes import sentinel_router
+from app.core.lifespan import app_lifespan
 
-app = FastAPI(title="Hexagonal FastAPI Example")
+app = FastAPI(title="Hexagonal FastAPI Example", lifespan=app_lifespan)
 app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(user_router, prefix="/api")
