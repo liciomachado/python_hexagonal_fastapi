@@ -102,15 +102,18 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_ndmi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDMI {e} não disponível na imagem selecionada."))
-            (image, ndmi_mean, ndmi_min, ndmi_max), geometry_cloud_percentual = await asyncio.gather(
-                asyncio.to_thread(
-                    self._download_crop_ndmi_image,
-                    assets, geom_bounds, geom, generate_image, provider,
-                ),
-                asyncio.to_thread(
-                    self._compute_cloud_percentual_over_geometry,
-                    selected, geom, geom_bounds, provider,
-                ),
+            geometry_cloud_percentual = await asyncio.to_thread(
+                self._compute_cloud_percentual_over_geometry,
+                selected, geom, geom_bounds, provider,
+            )
+            cloud_error = self._validate_geometry_cloud_percentual(
+                geometry_cloud_percentual, cloud_percentual
+            )
+            if cloud_error is not None:
+                return Result.Err(cloud_error)
+            image, ndmi_mean, ndmi_min, ndmi_max = await asyncio.to_thread(
+                self._download_crop_ndmi_image,
+                assets, geom_bounds, geom, generate_image, provider,
             )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
@@ -148,15 +151,18 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_rgb_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset RGB {e} não disponível na imagem selecionada."))
-            image, geometry_cloud_percentual = await asyncio.gather(
-                asyncio.to_thread(
-                    self._download_crop_rgb_image,
-                    assets, geom_bounds, geom, provider,
-                ),
-                asyncio.to_thread(
-                    self._compute_cloud_percentual_over_geometry,
-                    selected, geom, geom_bounds, provider,
-                ),
+            geometry_cloud_percentual = await asyncio.to_thread(
+                self._compute_cloud_percentual_over_geometry,
+                selected, geom, geom_bounds, provider,
+            )
+            cloud_error = self._validate_geometry_cloud_percentual(
+                geometry_cloud_percentual, cloud_percentual
+            )
+            if cloud_error is not None:
+                return Result.Err(cloud_error)
+            image = await asyncio.to_thread(
+                self._download_crop_rgb_image,
+                assets, geom_bounds, geom, provider,
             )
 
             return Result.Ok(PlanetaryImageVisualResponse(
@@ -193,15 +199,18 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 assets = self._get_ndvi_assets(selected)
             except KeyError as e:
                 return Result.Err(BadRequestError(f"Asset NDVI {e} não disponível na imagem selecionada."))
-            (image, ndvi_mean, ndvi_min, ndvi_max), geometry_cloud_percentual = await asyncio.gather(
-                asyncio.to_thread(
-                    self._download_crop_ndvi_image,
-                    assets, geom_bounds, geom, generate_image, provider,
-                ),
-                asyncio.to_thread(
-                    self._compute_cloud_percentual_over_geometry,
-                    selected, geom, geom_bounds, provider,
-                ),
+            geometry_cloud_percentual = await asyncio.to_thread(
+                self._compute_cloud_percentual_over_geometry,
+                selected, geom, geom_bounds, provider,
+            )
+            cloud_error = self._validate_geometry_cloud_percentual(
+                geometry_cloud_percentual, cloud_percentual
+            )
+            if cloud_error is not None:
+                return Result.Err(cloud_error)
+            image, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
+                self._download_crop_ndvi_image,
+                assets, geom_bounds, geom, generate_image, provider,
             )
             return Result.Ok(PlanetaryNdviImageResponse(
                 day=day,
@@ -276,6 +285,18 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         cloud_pixels = int(np.isin(scl_inside, list(SCL_CLOUD_CLASSES)).sum())
         return round(cloud_pixels / scl_inside.size * 100, 2)
+
+    def _validate_geometry_cloud_percentual(
+        self,
+        computed_cloud_percentual: float,
+        max_allowed_cloud_percentual: float,
+    ) -> BadRequestError | None:
+        if computed_cloud_percentual > max_allowed_cloud_percentual:
+            return BadRequestError(
+                f"Cobertura de nuvens sobre a geometria ({computed_cloud_percentual}%) "
+                f"excede o limite permitido ({max_allowed_cloud_percentual}%)."
+            )
+        return None
 
     def _prepare_image_for_report(self, pil_img: Image.Image) -> Image.Image:
         width, height = pil_img.size
