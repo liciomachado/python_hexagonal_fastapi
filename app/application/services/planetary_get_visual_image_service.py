@@ -25,7 +25,9 @@ from app.application.services.dtos.planetary_ndvi_image_response import Planetar
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.raster_helpers import build_rasterio_gdal_config, compute_out_shape, window_from_bounds
+from app.application.services.sensor_profile import SensorProfile, get_sensor_profile, normalize_band_values
 from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName, resolve_band_href
 from app.core.cache_key import build_cache_key
@@ -39,7 +41,6 @@ logger = logging.getLogger("app.image")
 
 REPORT_MAX_IMAGE_DIMENSION = 1200
 REPORT_JPEG_QUALITY = 85
-ALL_PRODUCT_BANDS = ("B02", "B03", "B04", "B08", "B11")
 
 
 @dataclass
@@ -61,6 +62,7 @@ class PlanetaryVisualImageServicePort(ABC):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
@@ -71,6 +73,7 @@ class PlanetaryVisualImageServicePort(ABC):
         cloud_percentual: float,
         geometry: str,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryImageVisualResponse, AppError]:
         pass
 
@@ -82,6 +85,7 @@ class PlanetaryVisualImageServicePort(ABC):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
         pass
 
@@ -93,6 +97,7 @@ class PlanetaryVisualImageServicePort(ABC):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryAllImagesResponse, AppError]:
         pass
 
@@ -121,7 +126,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
+        profile = get_sensor_profile(satellite_collection)
         metrics = PerformanceMetrics(context="ndmi")
         cache_key = build_cache_key(
             "ndmi",
@@ -130,6 +137,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             cloud_percentual=cloud_percentual,
             generate_image=generate_image,
             preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
         )
         cached = await self._try_get_cached_ndvi(cache_key)
         if cached is not None:
@@ -138,7 +146,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
-                    day, cloud_percentual, geometry, preferred_provider, metrics
+                    day, cloud_percentual, geometry, preferred_provider, metrics, satellite_collection
                 )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
@@ -151,6 +159,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     geom,
                     generate_image,
                     provider,
+                    profile,
                 )
 
             image_url = None
@@ -158,7 +167,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 with metrics.span("blob_upload"):
                     image_url = await self._upload_jpeg(
                         jpeg_bytes,
-                        f"sentinel/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
+                        f"{profile.blob_prefix}/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
                     )
 
             response = PlanetaryNdviImageResponse(
@@ -184,7 +193,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         cloud_percentual: float,
         geometry: str,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryImageVisualResponse, AppError]:
+        profile = get_sensor_profile(satellite_collection)
         metrics = PerformanceMetrics(context="visual")
         cache_key = build_cache_key(
             "visual",
@@ -192,6 +203,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             geometry=geometry,
             cloud_percentual=cloud_percentual,
             preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
         )
         cached = await self._try_get_cached_visual(cache_key)
         if cached is not None:
@@ -200,7 +212,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
-                    day, cloud_percentual, geometry, preferred_provider, metrics
+                    day, cloud_percentual, geometry, preferred_provider, metrics, satellite_collection
                 )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
@@ -212,12 +224,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     geom_bounds,
                     geom,
                     provider,
+                    profile,
                 )
 
             with metrics.span("blob_upload"):
                 image_url = await self._upload_jpeg(
                     jpeg_bytes,
-                    f"sentinel/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
+                    f"{profile.blob_prefix}/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
                 )
 
             response = PlanetaryImageVisualResponse(
@@ -240,7 +253,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryNdviImageResponse, AppError]:
+        profile = get_sensor_profile(satellite_collection)
         metrics = PerformanceMetrics(context="ndvi")
         cache_key = build_cache_key(
             "ndvi",
@@ -249,6 +264,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             cloud_percentual=cloud_percentual,
             generate_image=generate_image,
             preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
         )
         cached = await self._try_get_cached_ndvi(cache_key)
         if cached is not None:
@@ -257,7 +273,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
-                    day, cloud_percentual, geometry, preferred_provider, metrics
+                    day, cloud_percentual, geometry, preferred_provider, metrics, satellite_collection
                 )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
@@ -270,6 +286,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     geom,
                     generate_image,
                     provider,
+                    profile,
                 )
 
             image_url = None
@@ -277,7 +294,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 with metrics.span("blob_upload"):
                     image_url = await self._upload_jpeg(
                         jpeg_bytes,
-                        f"sentinel/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
+                        f"{profile.blob_prefix}/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
                     )
 
             response = PlanetaryNdviImageResponse(
@@ -304,7 +321,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geometry: str,
         generate_image: bool,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> Result[PlanetaryAllImagesResponse, AppError]:
+        profile = get_sensor_profile(satellite_collection)
         metrics = PerformanceMetrics(context="all")
         cache_key = build_cache_key(
             "all",
@@ -313,6 +332,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             cloud_percentual=cloud_percentual,
             generate_image=generate_image,
             preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
         )
         cached = await self._try_get_cached_all(cache_key)
         if cached is not None:
@@ -321,7 +341,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
-                    day, cloud_percentual, geometry, preferred_provider, metrics
+                    day, cloud_percentual, geometry, preferred_provider, metrics, satellite_collection
                 )
             if selected is None:
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
@@ -334,6 +354,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     geom,
                     generate_image,
                     provider,
+                    profile,
                 )
 
             visual_jpeg, ndvi_jpeg, ndmi_jpeg, ndvi_stats, ndmi_stats = pipeline_result
@@ -341,7 +362,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             with metrics.span("blob_upload"):
                 visual_url = await self._upload_jpeg(
                     visual_jpeg,
-                    f"sentinel/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
+                    f"{profile.blob_prefix}/{selected.id}/visual/{uuid.uuid4().hex}.jpg",
                 )
                 ndvi_url = None
                 ndmi_url = None
@@ -349,12 +370,12 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     if ndvi_jpeg is not None:
                         ndvi_url = await self._upload_jpeg(
                             ndvi_jpeg,
-                            f"sentinel/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
+                            f"{profile.blob_prefix}/{selected.id}/ndvi/{uuid.uuid4().hex}.jpg",
                         )
                     if ndmi_jpeg is not None:
                         ndmi_url = await self._upload_jpeg(
                             ndmi_jpeg,
-                            f"sentinel/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
+                            f"{profile.blob_prefix}/{selected.id}/ndmi/{uuid.uuid4().hex}.jpg",
                         )
 
             response = PlanetaryAllImagesResponse(
@@ -397,6 +418,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geometry: str,
         preferred_provider: PreferredProvider | None,
         metrics: PerformanceMetrics,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> tuple[pystac.Item | None, StacProviderName, BaseGeometry, tuple, float]:
         geom, geojson_geom, geom_bounds = self.map_geom(geometry)
         with metrics.span("stac_search"):
@@ -406,6 +428,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 geom=geom,
                 geojson_geom=geojson_geom,
                 preferred_provider=preferred_provider,
+                satellite_collection=satellite_collection,
             )
         if selected is None:
             return None, provider, geom, geom_bounds, 0.0
@@ -417,6 +440,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 geom,
                 geom_bounds,
                 provider,
+                satellite_collection,
             )
         cloud_error = self._validate_geometry_cloud_percentual(
             geometry_cloud_percentual,
@@ -434,6 +458,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom: BaseGeometry,
         geojson_geom: dict,
         preferred_provider: PreferredProvider | None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> tuple[pystac.Item | None, StacProviderName]:
         provider_enum = self._parse_preferred_provider(preferred_provider)
         search_result = await self._stac_facade.search_items_by_day(
@@ -441,6 +466,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             day=day,
             max_items=10,
             preferred_provider=provider_enum,
+            collection=satellite_collection,
         )
         items = search_result.items
         if not items:
@@ -472,6 +498,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom_bounds: tuple,
         provider: StacProviderName,
         band_keys: tuple[str, ...],
+        profile: SensorProfile,
         reference_band_key: str = "B04",
     ) -> tuple[dict[str, np.ndarray], RasterContext]:
         reference_href = self._sign_url(resolve_band_href(item, reference_band_key), provider)
@@ -514,12 +541,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         src.width,
                         src.height,
                     )
-                    bands[band_key] = src.read(
+                    raw = src.read(
                         1,
                         window=band_window,
                         out_shape=out_shape,
                         resampling=resampling,
                     ).astype(np.float32)
+                    bands[band_key] = normalize_band_values(raw, profile)
 
         return bands, ctx
 
@@ -529,16 +557,21 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom_bounds: tuple,
         geom: BaseGeometry,
         provider: StacProviderName,
+        profile: SensorProfile,
     ) -> bytes:
-        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B02", "B03", "B04"))
-        b02 = np.clip(bands["B02"], 0, 3000)
-        b03 = np.clip(bands["B03"], 0, 3000)
-        b04 = np.clip(bands["B04"], 0, 3000)
+        red_key, green_key, blue_key = profile.rgb_bands
+        bands, ctx = self._read_shared_bands(
+            item, geom_bounds, provider, (blue_key, green_key, red_key), profile, reference_band_key=red_key
+        )
+        clip_max = profile.rgb_clip_max
+        b02 = np.clip(bands[blue_key], 0, clip_max)
+        b03 = np.clip(bands[green_key], 0, clip_max)
+        b04 = np.clip(bands[red_key], 0, clip_max)
         image_rgb = np.stack(
             [
-                (b04 / 3000 * 255).astype(np.uint8),
-                (b03 / 3000 * 255).astype(np.uint8),
-                (b02 / 3000 * 255).astype(np.uint8),
+                (b04 / clip_max * 255).astype(np.uint8),
+                (b03 / clip_max * 255).astype(np.uint8),
+                (b02 / clip_max * 255).astype(np.uint8),
             ],
             axis=-1,
         )
@@ -552,11 +585,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom: BaseGeometry,
         generate_image: bool,
         provider: StacProviderName,
+        profile: SensorProfile,
     ) -> tuple[bytes | None, float | None, float | None, float | None]:
-        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ("B04", "B08"))
+        nir_key, red_key = profile.ndvi_bands
+        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, (red_key, nir_key), profile)
         return self._build_index_product(
-            bands["B08"],
-            bands["B04"],
+            bands[nir_key],
+            bands[red_key],
             geom,
             ctx,
             generate_image,
@@ -572,17 +607,20 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom: BaseGeometry,
         generate_image: bool,
         provider: StacProviderName,
+        profile: SensorProfile,
     ) -> tuple[bytes | None, float | None, float | None, float | None]:
+        nir_key, swir_key = profile.ndmi_bands
         bands, ctx = self._read_shared_bands(
             item,
             geom_bounds,
             provider,
-            ("B08", "B11"),
-            reference_band_key="B11",
+            (nir_key, swir_key),
+            profile,
+            reference_band_key=profile.ndmi_reference_band,
         )
         return self._build_index_product(
-            bands["B08"],
-            bands["B11"],
+            bands[nir_key],
+            bands[swir_key],
             geom,
             ctx,
             generate_image,
@@ -598,25 +636,31 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom: BaseGeometry,
         generate_image: bool,
         provider: StacProviderName,
+        profile: SensorProfile,
     ) -> tuple[bytes, bytes | None, bytes | None, tuple, tuple]:
-        bands, ctx = self._read_shared_bands(item, geom_bounds, provider, ALL_PRODUCT_BANDS)
+        red_key, green_key, blue_key = profile.rgb_bands
+        nir_key, swir_key = profile.ndmi_bands
+        bands, ctx = self._read_shared_bands(
+            item, geom_bounds, provider, profile.all_bands, profile, reference_band_key=red_key
+        )
 
-        b02 = np.clip(bands["B02"], 0, 3000)
-        b03 = np.clip(bands["B03"], 0, 3000)
-        b04 = np.clip(bands["B04"], 0, 3000)
+        clip_max = profile.rgb_clip_max
+        b02 = np.clip(bands[blue_key], 0, clip_max)
+        b03 = np.clip(bands[green_key], 0, clip_max)
+        b04 = np.clip(bands[red_key], 0, clip_max)
         image_rgb = np.stack(
             [
-                (b04 / 3000 * 255).astype(np.uint8),
-                (b03 / 3000 * 255).astype(np.uint8),
-                (b02 / 3000 * 255).astype(np.uint8),
+                (b04 / clip_max * 255).astype(np.uint8),
+                (b03 / clip_max * 255).astype(np.uint8),
+                (b02 / clip_max * 255).astype(np.uint8),
             ],
             axis=-1,
         )
         visual_jpeg = self._finalize_image_bytes(Image.fromarray(image_rgb), geom, ctx)
 
         ndvi_jpeg, ndvi_mean, ndvi_min, ndvi_max = self._build_index_product(
-            bands["B08"],
-            bands["B04"],
+            bands[nir_key],
+            bands[red_key],
             geom,
             ctx,
             generate_image,
@@ -625,8 +669,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             is_ndvi=True,
         )
         ndmi_jpeg, ndmi_mean, ndmi_min, ndmi_max = self._build_index_product(
-            bands["B08"],
-            bands["B11"],
+            bands[nir_key],
+            bands[swir_key],
             geom,
             ctx,
             generate_image,
@@ -848,7 +892,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             center_y + size / square_parameter,
         )
         geojson_geom = mapping(square_geom)
-        buffer = 0.050
+        buffer = 0.010
         geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
         return geom, geojson_geom, geom_bounds
 

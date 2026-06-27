@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from datetime import date, datetime
 
+from app.application.services.stac.satellite_collection import SatelliteCollection
 from app.application.services.stac.stac_types import StacProviderName, StacSearchResult
 
 
@@ -16,6 +17,7 @@ class StacProviderPort(ABC):
         geojson_geom: dict,
         day: date,
         max_items: int,
+        collection: SatelliteCollection,
     ) -> StacSearchResult:
         pass
 
@@ -26,6 +28,7 @@ class StacProviderPort(ABC):
         start_date: datetime,
         end_date: datetime,
         limit: int,
+        collection: SatelliteCollection,
     ) -> StacSearchResult:
         pass
 

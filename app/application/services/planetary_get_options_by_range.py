@@ -12,6 +12,7 @@ from shapely.geometry.base import BaseGeometry
 from app.application.services.dtos.planetary_images_filter_response import PlanetaryImageFilterResponse
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacProviderName
 from app.core.config import Config
@@ -25,6 +26,7 @@ class PlanetaryGetOptionImagesByRangeServicePort(ABC):
         start_date: datetime,
         end_date: datetime,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> List[PlanetaryImageFilterResponse]:
         pass
 
@@ -45,6 +47,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         start_date: datetime,
         end_date: datetime,
         preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> List[PlanetaryImageFilterResponse]:
         geom, geom_bounds = self._parse_geometry(geometry)
         geojson_geom = mapping(geom)
@@ -57,6 +60,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
             end_date=end_date,
             limit=100,
             preferred_provider=provider_enum,
+            collection=satellite_collection,
         )
 
         items_by_id = {item.id: item for item in search_result.items}
@@ -76,6 +80,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
             geom,
             geom_bounds,
             search_result.provider,
+            search_result.collection,
         )
 
     async def _enrich_with_geometry_cloud_cover(
@@ -85,6 +90,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         geom: BaseGeometry,
         geom_bounds: tuple[float, float, float, float],
         provider: StacProviderName,
+        collection: SatelliteCollection,
     ) -> List[PlanetaryImageFilterResponse]:
         if not items:
             return items
@@ -102,6 +108,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
                     geom,
                     geom_bounds,
                     provider,
+                    collection,
                 )
 
         await asyncio.gather(*(enrich(item) for item in items))

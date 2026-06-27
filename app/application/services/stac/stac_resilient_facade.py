@@ -4,6 +4,10 @@ import logging
 from app.application.services.resilience.circuit_breaker import CircuitBreaker
 from app.application.services.stac.providers.earth_search_stac_provider import EarthSearchStacProvider
 from app.application.services.stac.providers.planetary_stac_provider import PlanetaryStacProvider
+from app.application.services.stac.satellite_collection import (
+    DEFAULT_SATELLITE_COLLECTION,
+    SatelliteCollection,
+)
 from app.application.services.stac.stac_provider_port import StacProviderPort
 from app.application.services.stac.stac_types import (
     StacGatewayTimeoutError,
@@ -37,10 +41,13 @@ class StacResilientFacade:
         day: date,
         max_items: int,
         preferred_provider: StacProviderName | None = None,
+        collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> StacSearchResult:
         return await self._execute_with_fallback(
             preferred_provider=preferred_provider,
-            operation=lambda provider: provider.search_items_by_day(geojson_geom, day, max_items),
+            operation=lambda provider: provider.search_items_by_day(
+                geojson_geom, day, max_items, collection
+            ),
         )
 
     async def search_items_by_range(
@@ -50,11 +57,12 @@ class StacResilientFacade:
         end_date: datetime,
         limit: int,
         preferred_provider: StacProviderName | None = None,
+        collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> StacSearchResult:
         return await self._execute_with_fallback(
             preferred_provider=preferred_provider,
             operation=lambda provider: provider.search_items_by_range(
-                geojson_geom, start_date, end_date, limit
+                geojson_geom, start_date, end_date, limit, collection
             ),
         )
 

@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageServicePort
 from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
 from app.core.utils.result import AppError, Result
 from datetime import date
 
@@ -9,6 +10,7 @@ class GetVisualImageByDayRequest(BaseModel):
     cloud_percentual: float
     geometry: str
     preferred_provider: PreferredProvider | None = None
+    satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION
 
 class GetVisualImageByDayResponse(BaseModel):
     day: date
@@ -25,6 +27,7 @@ class GetVisualImageByDayUseCase:
             cloud_percentual=request.cloud_percentual,
             geometry=request.geometry,
             preferred_provider=request.preferred_provider,
+            satellite_collection=request.satellite_collection,
         )
         if response.is_err():
             return Result.Err(response.error())

@@ -5,6 +5,11 @@ from app.core.config import Config
 
 SCL_CLOUD_CLASSES = frozenset({3, 8, 9, 10})
 
+# Landsat Collection 2 QA_PIXEL bit flags (USGS LSDS-1619)
+QA_PIXEL_CLOUD = 1 << 3
+QA_PIXEL_CLOUD_SHADOW = 1 << 4
+QA_PIXEL_CLOUD_MASK_BITS = QA_PIXEL_CLOUD | QA_PIXEL_CLOUD_SHADOW
+
 
 def build_rasterio_gdal_config() -> dict[str, str]:
     return {

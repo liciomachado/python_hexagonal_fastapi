@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageServicePort
 from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
 from app.core.utils.result import AppError, Result
 
 
@@ -13,6 +14,7 @@ class GetNdviImageByDayRequest(BaseModel):
     geometry: str
     generate_image: bool = True
     preferred_provider: PreferredProvider | None = None
+    satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION
 
 class GetNdviImageByDayResponse(BaseModel):
     day: date
@@ -34,6 +36,7 @@ class GetNdviImageByDayUseCase:
             geometry=request.geometry,
             generate_image=request.generate_image,
             preferred_provider=request.preferred_provider,
+            satellite_collection=request.satellite_collection,
         )
 
         if response.is_err():

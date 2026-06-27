@@ -2,6 +2,7 @@ from typing import Any, List
 
 from app.application.services.planetary_get_options_by_range import PlanetaryGetOptionImagesByRangeServicePort
 from app.application.services.stac.preferred_provider import PreferredProvider
+from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
 from app.core.utils.result import AppError, NotFoundError, Result
 from datetime import datetime
 from pydantic import BaseModel
@@ -11,6 +12,7 @@ class GetImagesByRangeRequest(BaseModel):
     dt_end: datetime
     geom: str
     preferred_provider: PreferredProvider | None = None
+    satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION
     
 class GetImagesByRangeResponse(BaseModel):
     id: str
@@ -28,6 +30,7 @@ class GetImagesByRangeUseCase:
             start_date=request.dt_start,
             end_date=request.dt_end,
             preferred_provider=request.preferred_provider,
+            satellite_collection=request.satellite_collection,
         )
 
         if not images:

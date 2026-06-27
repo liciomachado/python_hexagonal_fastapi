@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.application.services.resilience.circuit_breaker import CircuitBreaker
 from app.application.services.stac.providers.earth_search_stac_provider import EarthSearchStacProvider
 from app.application.services.stac.providers.planetary_stac_provider import PlanetaryStacProvider
+from app.application.services.stac.satellite_collection import SatelliteCollection
 from app.application.services.stac.stac_resilient_facade import StacResilientFacade
 from app.application.services.stac.stac_types import StacGatewayTimeoutError, StacProviderName, StacSearchResult
 
@@ -69,6 +70,25 @@ class StacResilientFacadeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, StacProviderName.EARTH_SEARCH)
         planetary.search_items_by_day.assert_not_called()
         self.assertFalse(breaker.is_open())
+
+    async def test_passes_landsat_collection_to_provider(self):
+        facade, planetary, earth, _ = self._build_facade()
+        expected = StacSearchResult(
+            items=[], provider=StacProviderName.PLANETARY, collection=SatelliteCollection.LANDSAT_C2_L2
+        )
+        planetary.search_items_by_day = AsyncMock(return_value=expected)
+
+        result = await facade.search_items_by_day(
+            {},
+            date(2007, 6, 1),
+            10,
+            collection=SatelliteCollection.LANDSAT_C2_L2,
+        )
+
+        self.assertEqual(result.collection, SatelliteCollection.LANDSAT_C2_L2)
+        planetary.search_items_by_day.assert_awaited_once()
+        call_args = planetary.search_items_by_day.await_args.args
+        self.assertEqual(call_args[3], SatelliteCollection.LANDSAT_C2_L2)
 
 
 if __name__ == "__main__":
