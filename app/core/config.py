@@ -25,6 +25,8 @@ class Config:
 
     IMAGE_POLYGON_INTERP_POINTS = int(os.getenv("IMAGE_POLYGON_INTERP_POINTS", "80"))
     IMAGE_POLYGON_BORDER_WIDTH = int(os.getenv("IMAGE_POLYGON_BORDER_WIDTH", "10"))
+    IMAGE_BOUNDS_MARGIN_RATIO = float(os.getenv("IMAGE_BOUNDS_MARGIN_RATIO", "0.15"))
+    IMAGE_BOUNDS_MIN_SPAN = float(os.getenv("IMAGE_BOUNDS_MIN_SPAN", "0.001"))
     IMAGE_ENABLE_SHARPEN = os.getenv("IMAGE_ENABLE_SHARPEN", "false").lower() == "true"
     SCL_MAX_DIMENSION = int(os.getenv("SCL_MAX_DIMENSION", "512"))
     SCL_CONCURRENT_READS = int(os.getenv("SCL_CONCURRENT_READS", "5"))

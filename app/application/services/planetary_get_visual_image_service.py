@@ -117,6 +117,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._gdal_config = build_rasterio_gdal_config()
         self._interp_points = Config.IMAGE_POLYGON_INTERP_POINTS
         self._border_width = Config.IMAGE_POLYGON_BORDER_WIDTH
+        self._bounds_margin_ratio = Config.IMAGE_BOUNDS_MARGIN_RATIO
+        self._bounds_min_span = Config.IMAGE_BOUNDS_MIN_SPAN
         self._enable_sharpen = Config.IMAGE_ENABLE_SHARPEN
 
     async def get_ndmi_image(
@@ -881,7 +883,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         minx, miny, maxx, maxy = bounds
         width = maxx - minx
         height = maxy - miny
-        size = max(width, height)
+        size = max(width, height, self._bounds_min_span)
         square_parameter = 2
         center_x = (minx + maxx) / square_parameter
         center_y = (miny + maxy) / square_parameter
@@ -892,8 +894,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             center_y + size / square_parameter,
         )
         geojson_geom = mapping(square_geom)
-        buffer = 0.010
-        geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
+        margin = size * self._bounds_margin_ratio
+        half_extent = size / square_parameter + margin
+        geom_bounds = (
+            center_x - half_extent,
+            center_y - half_extent,
+            center_x + half_extent,
+            center_y + half_extent,
+        )
         return geom, geojson_geom, geom_bounds
 
     async def _try_get_cached_visual(self, key: str) -> PlanetaryImageVisualResponse | None:
