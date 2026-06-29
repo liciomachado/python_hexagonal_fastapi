@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
 import logging
@@ -23,6 +24,7 @@ from shapely.ops import transform as shapely_transform
 from app.application.services.dtos.planetary_all_images_response import PlanetaryAllImagesResponse
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
+from app.application.services.legacy_ndvi_stats import calc_ndvi, compute_legacy_ndvi_stats
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.raster_helpers import build_rasterio_gdal_config, compute_out_shape, window_from_bounds
 from app.application.services.sensor_profile import SensorProfile, get_sensor_profile, normalize_band_values
@@ -41,6 +43,7 @@ logger = logging.getLogger("app.image")
 
 REPORT_MAX_IMAGE_DIMENSION = 1200
 REPORT_JPEG_QUALITY = 85
+NDVI_STATS_ALGORITHM_VERSION = "legacy-v1"
 
 
 @dataclass
@@ -120,6 +123,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._bounds_margin_ratio = Config.IMAGE_BOUNDS_MARGIN_RATIO
         self._bounds_min_span = Config.IMAGE_BOUNDS_MIN_SPAN
         self._enable_sharpen = Config.IMAGE_ENABLE_SHARPEN
+        self._signed_url_cache: dict[tuple[str, str], str] = {}
+        self._legacy_stats_cache: dict[str, tuple[float | None, float | None, float | None]] = {}
+
+    def _begin_request_scoped_caches(self) -> None:
+        """Limpa caches in-process usados apenas dentro de uma requisição."""
+        self._signed_url_cache.clear()
+        self._legacy_stats_cache.clear()
 
     async def get_ndmi_image(
         self,
@@ -145,6 +155,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         if cached is not None:
             return Result.Ok(cached)
 
+        self._begin_request_scoped_caches()
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
@@ -211,6 +222,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         if cached is not None:
             return Result.Ok(cached)
 
+        self._begin_request_scoped_caches()
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
@@ -267,11 +279,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             generate_image=generate_image,
             preferred_provider=preferred_provider,
             satellite_collection=satellite_collection,
+            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
         )
         cached = await self._try_get_cached_ndvi(cache_key)
         if cached is not None:
             return Result.Ok(cached)
 
+        self._begin_request_scoped_caches()
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
@@ -335,11 +349,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             generate_image=generate_image,
             preferred_provider=preferred_provider,
             satellite_collection=satellite_collection,
+            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
         )
         cached = await self._try_get_cached_all(cache_key)
         if cached is not None:
             return Result.Ok(cached)
 
+        self._begin_request_scoped_caches()
         try:
             with metrics.span("prepare_context"):
                 selected, provider, geom, geom_bounds, geometry_cloud_percentual = await self._prepare_context(
@@ -482,6 +498,33 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 return item, search_result.provider
         return None, search_result.provider
 
+    def _compute_legacy_ndvi_stats(
+        self,
+        item: pystac.Item,
+        geom: BaseGeometry,
+        provider: StacProviderName,
+        profile: SensorProfile,
+    ) -> tuple[float | None, float | None, float | None]:
+        cache_key = build_cache_key(
+            "legacy_ndvi_stats",
+            sat_image_id=item.id,
+            geometry=geom.wkt,
+            satellite_collection=profile.collection.value,
+            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
+        )
+        cached = self._legacy_stats_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        stats = compute_legacy_ndvi_stats(
+            item,
+            geom,
+            profile,
+            sign_url=lambda href: self._sign_url(href, provider),
+        )
+        self._legacy_stats_cache[cache_key] = stats
+        return stats
+
     def _validate_geometry_cloud_percentual(
         self,
         computed_cloud_percentual: float,
@@ -504,6 +547,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         reference_band_key: str = "B04",
     ) -> tuple[dict[str, np.ndarray], RasterContext]:
         reference_href = self._sign_url(resolve_band_href(item, reference_band_key), provider)
+        resampling = Resampling.bilinear
+        bands: dict[str, np.ndarray] = {}
         with rasterio.Env(**self._gdal_config):
             with rasterio.open(reference_href) as ref_src:
                 image_crs = ref_src.crs
@@ -520,10 +565,23 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 scale_x = window.width / out_width
                 scale_y = window.height / out_height
                 crop_transform = crop_transform * crop_transform.scale(scale_x, scale_y)
+                out_shape = (out_height, out_width)
 
-        bands: dict[str, np.ndarray] = {}
-        resampling = Resampling.bilinear
-        out_shape = (out_height, out_width)
+                if reference_band_key in band_keys:
+                    band_window = window_from_bounds(
+                        geom_bounds_proj,
+                        ref_src.transform,
+                        ref_src.width,
+                        ref_src.height,
+                    )
+                    raw = ref_src.read(
+                        1,
+                        window=band_window,
+                        out_shape=out_shape,
+                        resampling=resampling,
+                    ).astype(np.float32)
+                    bands[reference_band_key] = normalize_band_values(raw, profile)
+
         ctx = RasterContext(
             window=window,
             crop_transform=crop_transform,
@@ -533,9 +591,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             out_width=out_width,
         )
 
-        with rasterio.Env(**self._gdal_config):
-            for band_key in band_keys:
-                href = self._sign_url(resolve_band_href(item, band_key), provider)
+        def _read_band(band_key: str) -> tuple[str, np.ndarray]:
+            href = self._sign_url(resolve_band_href(item, band_key), provider)
+            with rasterio.Env(**self._gdal_config):
                 with rasterio.open(href) as src:
                     band_window = window_from_bounds(
                         geom_bounds_proj,
@@ -549,7 +607,15 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         out_shape=out_shape,
                         resampling=resampling,
                     ).astype(np.float32)
-                    bands[band_key] = normalize_band_values(raw, profile)
+                    return band_key, normalize_band_values(raw, profile)
+
+        remaining_keys = [key for key in band_keys if key not in bands]
+
+        if remaining_keys:
+            max_workers = min(len(remaining_keys), 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for band_key, values in executor.map(_read_band, remaining_keys):
+                    bands[band_key] = values
 
         return bands, ctx
 
@@ -589,18 +655,26 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         provider: StacProviderName,
         profile: SensorProfile,
     ) -> tuple[bytes | None, float | None, float | None, float | None]:
+        ndvi_mean, ndvi_min, ndvi_max = self._compute_legacy_ndvi_stats(
+            item, geom, provider, profile
+        )
+
+        if not generate_image:
+            return None, ndvi_mean, ndvi_min, ndvi_max
+
         nir_key, red_key = profile.ndvi_bands
         bands, ctx = self._read_shared_bands(item, geom_bounds, provider, (red_key, nir_key), profile)
-        return self._build_index_product(
+        jpeg_bytes, _, _, _ = self._build_index_product(
             bands[nir_key],
             bands[red_key],
             geom,
             ctx,
-            generate_image,
+            True,
             NDVI_BANDWIDTH_COLORS_VALUES,
             BANDWIDTH_COLORS_NDVI,
             is_ndvi=True,
         )
+        return jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max
 
     def _process_ndmi_from_item(
         self,
@@ -660,7 +734,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         )
         visual_jpeg = self._finalize_image_bytes(Image.fromarray(image_rgb), geom, ctx)
 
-        ndvi_jpeg, ndvi_mean, ndvi_min, ndvi_max = self._build_index_product(
+        ndvi_mean, ndvi_min, ndvi_max = self._compute_legacy_ndvi_stats(
+            item, geom, provider, profile
+        )
+        ndvi_jpeg, _, _, _ = self._build_index_product(
             bands[nir_key],
             bands[red_key],
             geom,
@@ -790,7 +867,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         return StacProviderName(preferred_provider)
 
     def _sign_url(self, href: str, provider: StacProviderName) -> str:
-        return self._stac_facade.sign_asset_url(href, provider)
+        cache_key = (provider.value, href)
+        cached = self._signed_url_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        signed = self._stac_facade.sign_asset_url(href, provider)
+        self._signed_url_cache[cache_key] = signed
+        return signed
 
     def _extract_boundary_lines(self, geom_proj):
         from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
@@ -1090,19 +1173,3 @@ def calc_ndmi(b_nir: np.ndarray, b_swir: np.ndarray) -> np.ndarray | list:
         ndmi = np.where(denominator != 0, (b_nir - b_swir) / denominator, 0)
 
     return apply_filters(ndmi)
-
-
-def calc_ndvi(b_nir: np.ndarray, b_red: np.ndarray) -> np.ndarray | list:
-    if len(b_nir) == 0 or len(b_red) == 0:
-        return []
-
-    b_nir = b_nir.astype(float)
-    b_red = b_red.astype(float)
-
-    denominator = b_nir + b_red
-    denominator[denominator == 0] = ZERO_DIVISOR_FIX
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ndvi = np.where(denominator != 0, (b_nir - b_red) / denominator, 0)
-
-    return apply_filters(ndvi)
