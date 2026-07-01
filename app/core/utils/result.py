@@ -56,3 +56,7 @@ class ForbiddenError(AppError):
 
 class ConflictError(AppError):
     """Erro 409"""
+
+
+class InternalServerError(AppError):
+    """Erro 500"""

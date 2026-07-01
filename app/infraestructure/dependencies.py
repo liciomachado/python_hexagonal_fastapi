@@ -16,7 +16,7 @@ from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayUseC
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayUseCase
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
 from app.core.db import SessionLocal
-from app.core.utils.result import UnauthorizedError
+from app.core.utils.result import UnauthorizedError, ForbiddenError
 from app.infraestructure.repository.api_key_repository import ApiKeyRepository
 from app.infraestructure.repository.user_repository import UserRepository
 from app.application.usecases.create_user import CreateUserUseCase
@@ -87,7 +87,9 @@ async def validate_api_key(
     client = await usecase.execute(x_api_key)
     if client.is_err():
         error = client.error()
-        if error is UnauthorizedError:
+        if isinstance(error, UnauthorizedError):
             raise HTTPException(status_code=401, detail=str(error))
-        raise HTTPException(status_code=403, detail=str(error))
+        if isinstance(error, ForbiddenError):
+            raise HTTPException(status_code=403, detail=str(error))
+        raise HTTPException(status_code=500, detail=str(error))
     return client.value()

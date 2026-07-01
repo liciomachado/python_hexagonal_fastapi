@@ -1,25 +1,49 @@
 import logging
 import time
 
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from app.api.middleware.correlation_id import get_correlation_id
 
 logger = logging.getLogger("app.api")
 
 
-class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        start = time.perf_counter()
-        logger.info("INCOMING %s %s", request.method, request.url.path)
+class RequestLoggingMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
 
-        response = await call_next(request)
-        elapsed_ms = (time.perf_counter() - start) * 1000
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
+        start = time.perf_counter()
+        correlation_id = get_correlation_id(request)
         logger.info(
-            "INCOMING %s %s -> %s (%.1fms)",
+            "INCOMING %s %s [%s]",
             request.method,
             request.url.path,
-            response.status_code,
-            elapsed_ms,
+            correlation_id,
         )
-        return response
+
+        status_code = 500
+
+        async def send_with_logging(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        await self.app(scope, receive, send_with_logging)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "INCOMING %s %s -> %s (%.1fms) [%s]",
+            request.method,
+            request.url.path,
+            status_code,
+            elapsed_ms,
+            correlation_id,
+        )
