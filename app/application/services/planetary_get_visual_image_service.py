@@ -25,6 +25,7 @@ from app.application.services.dtos.planetary_all_images_response import Planetar
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
 from app.application.services.legacy_ndvi_stats import calc_ndvi, compute_legacy_ndvi_stats
+from app.application.services.geometry_bounds import compute_cloud_cover_geom_bounds
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.raster_helpers import build_rasterio_gdal_config, compute_out_shape, window_from_bounds
 from app.application.services.sensor_profile import SensorProfile, get_sensor_profile, normalize_band_values
@@ -439,6 +440,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> tuple[pystac.Item | None, StacProviderName, BaseGeometry, tuple, float]:
         geom, geojson_geom, geom_bounds = self.map_geom(geometry)
+        cloud_cover_geom_bounds = compute_cloud_cover_geom_bounds(geom)
         with metrics.span("stac_search"):
             selected, provider = await self._search_selected_item(
                 day=day,
@@ -456,7 +458,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 self._cloud_cover_service.compute_cloud_percentual_over_geometry,
                 selected,
                 geom,
-                geom_bounds,
+                cloud_cover_geom_bounds,
                 provider,
                 satellite_collection,
             )

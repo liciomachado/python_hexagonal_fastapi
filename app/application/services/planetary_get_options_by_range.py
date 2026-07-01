@@ -10,6 +10,7 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
 from app.application.services.dtos.planetary_images_filter_response import PlanetaryImageFilterResponse
+from app.application.services.geometry_bounds import compute_cloud_cover_geom_bounds
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.stac.preferred_provider import PreferredProvider
 from app.application.services.stac.satellite_collection import DEFAULT_SATELLITE_COLLECTION, SatelliteCollection
@@ -116,10 +117,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
 
     def _parse_geometry(self, geometry: str) -> tuple[BaseGeometry, tuple[float, float, float, float]]:
         geom = wkt.loads(geometry)
-        minx, miny, maxx, maxy = geom.bounds
-        buffer = 0.050
-        geom_bounds = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
-        return geom, geom_bounds
+        return geom, compute_cloud_cover_geom_bounds(geom)
 
     def mapAndGroupResult(self, features) -> List[PlanetaryImageFilterResponse]:
         responses = [
