@@ -1,6 +1,8 @@
 from typing import List
+
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
+
 from app.api.result_utils import unwrap_result
 from app.application.usecases.get_all_images_by_day import (
     GetAllImagesByDayRequest,
@@ -43,12 +45,12 @@ from app.infraestructure.dependencies import (
 
 sentinel_router = APIRouter(prefix="/sentinel", tags=["images"])
 
+
 @sentinel_router.get(
     "/health/planetarycomputer",
     summary="Verifica disponibilidade da API do Planetary Computer",
     response_model=CheckPlanetaryComputerHealthResponse,
 )
-
 async def planetary_computer_health(
     usecase: CheckPlanetaryComputerHealthUseCase = Depends(get_planetary_health_check_usecase),
 ):
@@ -56,7 +58,6 @@ async def planetary_computer_health(
     health = unwrap_result(result)
     if not health.healthy:
         return JSONResponse(status_code=503, content=health.model_dump())
-
     return health
 
 
@@ -73,6 +74,7 @@ async def get_images_by_range(
     images = await usecase.execute(request)
     return unwrap_result(images)
 
+
 @sentinel_router.post(
     "/visual",
     summary="Obtem a imagem visual do dia",
@@ -86,6 +88,7 @@ async def get_visual_image_by_day(
     visual_image = await usecase.execute(request)
     return unwrap_result(visual_image)
 
+
 @sentinel_router.post(
     "/ndvi-image",
     summary="Obtem a imagem NDVI do dia",
@@ -98,6 +101,7 @@ async def get_ndvi_image_by_day(
     visual_image = await usecase.execute(request)
     return unwrap_result(visual_image)
 
+
 @sentinel_router.post(
     "/ndmi-image",
     summary="Obtem a imagem NDMI do dia",
@@ -109,6 +113,7 @@ async def get_ndmi_image_by_day(
 ):
     visual_image = await usecase.execute(request)
     return unwrap_result(visual_image)
+
 
 @sentinel_router.post(
     "/all",
