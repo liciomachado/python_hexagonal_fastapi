@@ -3,6 +3,8 @@ from uuid import uuid4
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core.correlation_context import reset_correlation_id, set_correlation_id
+
 CORRELATION_ID_HEADER = "X-Correlation-Id"
 CORRELATION_ID_HEADER_BYTES = b"x-correlation-id"
 
@@ -34,17 +36,21 @@ class CorrelationIdMiddleware:
 
         scope.setdefault("state", {})["correlation_id"] = correlation_id
 
-        async def send_with_correlation_id(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
-                if not any(
-                    header_name.lower() == CORRELATION_ID_HEADER_BYTES
-                    for header_name, _ in headers
-                ):
-                    headers.append(
-                        (CORRELATION_ID_HEADER_BYTES, correlation_id.encode("latin-1"))
-                    )
-                    message = {**message, "headers": headers}
-            await send(message)
+        token = set_correlation_id(correlation_id)
+        try:
+            async def send_with_correlation_id(message: Message) -> None:
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers", []))
+                    if not any(
+                        header_name.lower() == CORRELATION_ID_HEADER_BYTES
+                        for header_name, _ in headers
+                    ):
+                        headers.append(
+                            (CORRELATION_ID_HEADER_BYTES, correlation_id.encode("latin-1"))
+                        )
+                        message = {**message, "headers": headers}
+                await send(message)
 
-        await self.app(scope, receive, send_with_correlation_id)
+            await self.app(scope, receive, send_with_correlation_id)
+        finally:
+            reset_correlation_id(token)

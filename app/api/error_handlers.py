@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.api.middleware.correlation_id import CORRELATION_ID_HEADER, get_correlation_id
+from app.core.correlation_context import get_context_correlation_id
 from app.api.schemas.error_response import InternalServerErrorResponse
 from app.core.utils.result import (
     AppError,
@@ -54,8 +55,13 @@ def _internal_server_error_response(request: Request) -> JSONResponse:
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     status_code = _status_for_app_error(exc)
+    correlation_id = get_correlation_id(request)
     if status_code == 500:
-        logger.error("Internal server error: %s", exc.message)
+        logger.error(
+            "Internal server error [%s]: %s",
+            correlation_id,
+            exc.message,
+        )
         return _internal_server_error_response(request)
 
     return _with_correlation_header(
@@ -66,7 +72,8 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
 
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     if exc.status_code == 500:
-        logger.error("HTTP 500: %s", exc.detail)
+        correlation_id = get_correlation_id(request)
+        logger.error("HTTP 500 [%s]: %s", correlation_id, exc.detail)
         return _internal_server_error_response(request)
 
     return _with_correlation_header(
@@ -76,7 +83,12 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled exception", exc_info=exc)
+    correlation_id = get_context_correlation_id() or get_correlation_id(request)
+    logger.exception(
+        "Unhandled exception [correlation_id=%s]",
+        correlation_id,
+        exc_info=exc,
+    )
     return _internal_server_error_response(request)
 
 
