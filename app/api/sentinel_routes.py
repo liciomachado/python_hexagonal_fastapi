@@ -19,6 +19,10 @@ from app.application.usecases.get_ndmi_image_by_day import (
     GetNdmiImageByDayResponse,
     GetNdmiImageByDayUseCase,
 )
+from app.application.usecases.get_ndvi_by_range import (
+    GetNdviByRangeRequest,
+    GetNdviByRangeUseCase,
+)
 from app.application.usecases.get_ndvi_image_by_day import (
     GetNdviImageByDayRequest,
     GetNdviImageByDayResponse,
@@ -37,6 +41,7 @@ from app.infraestructure.dependencies import (
     get_all_images_by_day_usecase,
     get_images_by_range_usecase,
     get_ndmi_image_by_day_usecase,
+    get_ndvi_by_range_usecase,
     get_ndvi_image_by_day_usecase,
     get_planetary_health_check_usecase,
     get_visual_image_by_day_usecase,
@@ -63,7 +68,7 @@ async def planetary_computer_health(
 
 @sentinel_router.post(
     "/days-available-in-range",
-    summary="Obtem todas as imagens disponiveis no range definido",
+    summary="Obtem todas as imagens disponiveis no range definido (melhor cena por dia via cloud_cover_geometry)",
     response_model=List[GetImagesByRangeResponse],
     # dependencies=[Depends(validate_api_key)],
 )
@@ -100,6 +105,19 @@ async def get_ndvi_image_by_day(
 ):
     visual_image = await usecase.execute(request)
     return unwrap_result(visual_image)
+
+
+@sentinel_router.post(
+    "/ndvi-by-range",
+    summary="Obtem NDVI por dia no range, filtrando por nuvem sobre o territorio",
+    response_model=List[GetNdviImageByDayResponse],
+)
+async def get_ndvi_by_range(
+    request: GetNdviByRangeRequest,
+    usecase: GetNdviByRangeUseCase = Depends(get_ndvi_by_range_usecase),
+):
+    ndvi_images = await usecase.execute(request)
+    return unwrap_result(ndvi_images)
 
 
 @sentinel_router.post(

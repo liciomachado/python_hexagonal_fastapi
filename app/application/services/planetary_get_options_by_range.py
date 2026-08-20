@@ -1,6 +1,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List
 
@@ -19,6 +20,15 @@ from app.application.services.stac.stac_types import StacProviderName
 from app.core.config import Config
 
 
+@dataclass
+class RangeDayCandidate:
+    id: str
+    datetime: datetime
+    cloud_cover: float | None
+    cloud_cover_geometry: float | None
+    stac_item: pystac.Item
+
+
 class PlanetaryGetOptionImagesByRangeServicePort(ABC):
     @abstractmethod
     async def search_images(
@@ -29,6 +39,17 @@ class PlanetaryGetOptionImagesByRangeServicePort(ABC):
         preferred_provider: PreferredProvider | None = None,
         satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> List[PlanetaryImageFilterResponse]:
+        pass
+
+    @abstractmethod
+    async def search_best_items_by_day(
+        self,
+        geometry: str,
+        start_date: datetime,
+        end_date: datetime,
+        preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
+    ) -> tuple[List[RangeDayCandidate], StacProviderName, SatelliteCollection]:
         pass
 
 
@@ -50,6 +71,33 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         preferred_provider: PreferredProvider | None = None,
         satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
     ) -> List[PlanetaryImageFilterResponse]:
+        candidates, _, _ = await self.search_best_items_by_day(
+            geometry=geometry,
+            start_date=start_date,
+            end_date=end_date,
+            preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
+        )
+        return [
+            PlanetaryImageFilterResponse(
+                id=candidate.id,
+                datetime=candidate.datetime,
+                cloud_cover=candidate.cloud_cover,
+                geometry=candidate.stac_item.geometry or {},
+                assets={key: asset.to_dict() for key, asset in candidate.stac_item.assets.items()},
+                cloud_cover_geometry=candidate.cloud_cover_geometry,
+            )
+            for candidate in candidates
+        ]
+
+    async def search_best_items_by_day(
+        self,
+        geometry: str,
+        start_date: datetime,
+        end_date: datetime,
+        preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
+    ) -> tuple[List[RangeDayCandidate], StacProviderName, SatelliteCollection]:
         geom, geom_bounds = self._parse_geometry(geometry)
         geojson_geom = mapping(geom)
         start_date, end_date = self.adjustDates(start_date, end_date)
@@ -65,24 +113,28 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         )
 
         items_by_id = {item.id: item for item in search_result.items}
-        features = [
-            {
-                "id": item.id,
-                "properties": item.properties,
-                "geometry": item.geometry,
-                "assets": {key: asset.to_dict() for key, asset in item.assets.items()},
-            }
-            for item in search_result.items
-        ]
-        grouped = self.mapAndGroupResult(features)
-        return await self._enrich_with_geometry_cloud_cover(
-            grouped,
+        mapped = self._map_features(search_result.items)
+        enriched = await self._enrich_with_geometry_cloud_cover(
+            mapped,
             items_by_id,
             geom,
             geom_bounds,
             search_result.provider,
             search_result.collection,
         )
+        best_per_day = self._group_and_select_best(enriched)
+        candidates = [
+            RangeDayCandidate(
+                id=item.id,
+                datetime=item.datetime,
+                cloud_cover=item.cloud_cover,
+                cloud_cover_geometry=item.cloud_cover_geometry,
+                stac_item=items_by_id[item.id],
+            )
+            for item in best_per_day
+            if item.id in items_by_id
+        ]
+        return candidates, search_result.provider, search_result.collection
 
     async def _enrich_with_geometry_cloud_cover(
         self,
@@ -119,7 +171,48 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
         geom = wkt.loads(geometry)
         return geom, compute_cloud_cover_geom_bounds(geom)
 
+    def _map_features(self, items: list[pystac.Item]) -> List[PlanetaryImageFilterResponse]:
+        return [
+            PlanetaryImageFilterResponse(
+                id=item.id,
+                datetime=datetime.fromisoformat(item.properties["datetime"]),
+                cloud_cover=item.properties.get("eo:cloud_cover"),
+                geometry=item.geometry or {},
+                assets={key: asset.to_dict() for key, asset in item.assets.items()},
+            )
+            for item in items
+        ]
+
+    def _group_and_select_best(
+        self,
+        items: List[PlanetaryImageFilterResponse],
+    ) -> List[PlanetaryImageFilterResponse]:
+        grouped: dict = defaultdict(list)
+        for item in items:
+            grouped[item.datetime.date()].append(item)
+
+        return [
+            self._select_best_item_by_geometry_cloud(day_items)
+            for day_items in grouped.values()
+            if day_items
+        ]
+
+    def _select_best_item_by_geometry_cloud(
+        self,
+        items: List[PlanetaryImageFilterResponse],
+    ) -> PlanetaryImageFilterResponse:
+        with_geometry_cloud = [i for i in items if i.cloud_cover_geometry is not None]
+        if with_geometry_cloud:
+            return min(with_geometry_cloud, key=lambda x: x.cloud_cover_geometry)
+
+        with_scene_cloud = [i for i in items if i.cloud_cover is not None]
+        if with_scene_cloud:
+            return min(with_scene_cloud, key=lambda x: x.cloud_cover)
+
+        return items[0]
+
     def mapAndGroupResult(self, features) -> List[PlanetaryImageFilterResponse]:
+        """Legacy helper kept for tests; prefers scene cloud cover (pre-enrichment path)."""
         responses = [
             PlanetaryImageFilterResponse(
                 id=feature["id"],
@@ -130,20 +223,7 @@ class PlanetaryGetOptionImagesByRangeService(PlanetaryGetOptionImagesByRangeServ
             )
             for feature in features
         ]
-
-        grouped = defaultdict(list)
-        for item in responses:
-            grouped[item.datetime].append(item)
-
-        result = []
-        for _, items in grouped.items():
-            filtered = [i for i in items if i.cloud_cover is not None]
-            if filtered:
-                best = min(filtered, key=lambda x: x.cloud_cover)
-            else:
-                best = items[0]
-            result.append(best)
-        return result
+        return self._group_and_select_best(responses)
 
     def adjustDates(self, start_date: datetime, end_date: datetime) -> tuple[datetime, datetime]:
         if start_date.tzinfo is None:

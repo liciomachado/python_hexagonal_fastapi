@@ -12,6 +12,7 @@ from app.application.usecases.check_planetary_computer_health import CheckPlanet
 from app.application.usecases.get_all_images_by_day import GetAllImagesByDayUseCase
 from app.application.usecases.get_images_by_range import GetImagesByRangeUseCase
 from app.application.usecases.get_ndmi_image_by_day import GetNdmiImageByDayUseCase
+from app.application.usecases.get_ndvi_by_range import GetNdviByRangeUseCase
 from app.application.usecases.get_ndvi_image_by_day import GetNdviImageByDayUseCase
 from app.application.usecases.get_visual_image_by_day import GetVisualImageByDayUseCase
 from app.application.usecases.validate_api_key import ValidateApiKeyUseCase
@@ -43,13 +44,15 @@ def get_api_key_usecase(db: AsyncSession = Depends(get_db)) -> ValidateApiKeyUse
 def _get_geometry_cloud_cover_service() -> GeometryCloudCoverService:
     return GeometryCloudCoverService(get_stac_facade())
 
-def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
-    stac_facade = get_stac_facade()
-    planetary_image_service = PlanetaryGetOptionImagesByRangeService(
-        stac_facade,
+@lru_cache
+def _get_planetary_range_images_service() -> PlanetaryGetOptionImagesByRangeService:
+    return PlanetaryGetOptionImagesByRangeService(
+        get_stac_facade(),
         cloud_cover_service=_get_geometry_cloud_cover_service(),
     )
-    return GetImagesByRangeUseCase(planetary_image_service)
+
+def get_images_by_range_usecase() -> GetImagesByRangeUseCase:
+    return GetImagesByRangeUseCase(_get_planetary_range_images_service())
 
 @lru_cache
 def _get_planetary_visual_image_service() -> PlanetaryVisualImageService:
@@ -58,6 +61,7 @@ def _get_planetary_visual_image_service() -> PlanetaryVisualImageService:
         cache_service=get_cache_service(),
         blob_storage=get_blob_storage_service(),
         cloud_cover_service=_get_geometry_cloud_cover_service(),
+        range_images_service=_get_planetary_range_images_service(),
     )
 
 def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:
@@ -65,6 +69,9 @@ def get_visual_image_by_day_usecase() -> GetVisualImageByDayUseCase:
 
 def get_ndvi_image_by_day_usecase() -> GetNdviImageByDayUseCase:
     return GetNdviImageByDayUseCase(_get_planetary_visual_image_service())
+
+def get_ndvi_by_range_usecase() -> GetNdviByRangeUseCase:
+    return GetNdviByRangeUseCase(_get_planetary_visual_image_service())
 
 def get_ndmi_image_by_day_usecase() -> GetNdmiImageByDayUseCase:
     return GetNdmiImageByDayUseCase(_get_planetary_visual_image_service())

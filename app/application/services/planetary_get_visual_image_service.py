@@ -5,8 +5,9 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyproj
@@ -36,9 +37,15 @@ from app.application.services.stac.stac_types import StacProviderName, resolve_b
 from app.core.cache_key import build_cache_key
 from app.core.config import Config
 from app.core.performance import PerformanceMetrics
-from app.core.utils.result import AppError, BadRequestError, Result
+from app.core.utils.result import AppError, BadRequestError, NotFoundError, Result
 from app.domain.ports.blob_storage_port import BlobStoragePort
 from app.domain.ports.cache_port import CachePort
+
+if TYPE_CHECKING:
+    from app.application.services.planetary_get_options_by_range import (
+        PlanetaryGetOptionImagesByRangeServicePort,
+        RangeDayCandidate,
+    )
 
 logger = logging.getLogger("app.image")
 
@@ -105,6 +112,19 @@ class PlanetaryVisualImageServicePort(ABC):
     ) -> Result[PlanetaryAllImagesResponse, AppError]:
         pass
 
+    @abstractmethod
+    async def get_ndvi_by_range(
+        self,
+        dt_start: datetime,
+        dt_end: datetime,
+        geometry: str,
+        cloud_percentual: float,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
+    ) -> Result[list[PlanetaryNdviImageResponse], AppError]:
+        pass
+
 
 class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     def __init__(
@@ -113,11 +133,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         cache_service: CachePort | None = None,
         blob_storage: BlobStoragePort | None = None,
         cloud_cover_service: GeometryCloudCoverService | None = None,
+        range_images_service: "PlanetaryGetOptionImagesByRangeServicePort | None" = None,
     ):
         self._stac_facade = stac_facade
         self._cache = cache_service
         self._blob_storage = blob_storage
         self._cloud_cover_service = cloud_cover_service or GeometryCloudCoverService(stac_facade)
+        self._range_images_service = range_images_service
         self._gdal_config = build_rasterio_gdal_config()
         self._interp_points = Config.IMAGE_POLYGON_INTERP_POINTS
         self._border_width = Config.IMAGE_POLYGON_BORDER_WIDTH
@@ -196,6 +218,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             await self._set_cached_ndvi(cache_key, response)
             metrics.log_summary()
             return Result.Ok(response)
+        except AppError as ex:
+            return Result.Err(ex)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
@@ -256,6 +280,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             await self._set_cached_visual(cache_key, response)
             metrics.log_summary()
             return Result.Ok(response)
+        except AppError as ex:
+            return Result.Err(ex)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
@@ -326,6 +352,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             await self._set_cached_ndvi(cache_key, response)
             metrics.log_summary()
             return Result.Ok(response)
+        except AppError as ex:
+            return Result.Err(ex)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
@@ -425,10 +453,105 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             await self._set_cached_all(cache_key, response)
             metrics.log_summary()
             return Result.Ok(response)
+        except AppError as ex:
+            return Result.Err(ex)
         except ValueError as ex:
             return Result.Err(str(ex))
         except Exception as ex:
             return Result.Err(f"Erro inesperado ao buscar imagens: {str(ex)}")
+
+    async def get_ndvi_by_range(
+        self,
+        dt_start: datetime,
+        dt_end: datetime,
+        geometry: str,
+        cloud_percentual: float,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None = None,
+        satellite_collection: SatelliteCollection = DEFAULT_SATELLITE_COLLECTION,
+    ) -> Result[list[PlanetaryNdviImageResponse], AppError]:
+        if self._range_images_service is None:
+            return Result.Err(BadRequestError("Serviço de busca por range não configurado."))
+
+        profile = get_sensor_profile(satellite_collection)
+        metrics = PerformanceMetrics(context="ndvi_by_range")
+        cache_key = build_cache_key(
+            "ndvi_by_range",
+            dt_start=dt_start,
+            dt_end=dt_end,
+            geometry=geometry,
+            cloud_percentual=cloud_percentual,
+            generate_image=generate_image,
+            preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
+            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
+        )
+        cached = await self._try_get_cached_ndvi_range(cache_key)
+        if cached is not None:
+            return Result.Ok(cached)
+
+        self._begin_request_scoped_caches()
+        try:
+            with metrics.span("stac_range_search"):
+                candidates, provider, _ = await self._range_images_service.search_best_items_by_day(
+                    geometry=geometry,
+                    start_date=dt_start,
+                    end_date=dt_end,
+                    preferred_provider=preferred_provider,
+                    satellite_collection=satellite_collection,
+                )
+
+            eligible = [
+                c
+                for c in candidates
+                if c.cloud_cover_geometry is not None and c.cloud_cover_geometry <= cloud_percentual
+            ]
+            if not eligible:
+                return Result.Err(NotFoundError("No images found"))
+
+            geom, _, geom_bounds = self.map_geom(geometry)
+            semaphore = asyncio.Semaphore(Config.SCL_CONCURRENT_READS)
+
+            async def process_day(candidate: "RangeDayCandidate") -> PlanetaryNdviImageResponse:
+                async with semaphore:
+                    jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
+                        self._process_ndvi_from_item,
+                        candidate.stac_item,
+                        geom_bounds,
+                        geom,
+                        generate_image,
+                        provider,
+                        profile,
+                    )
+                    image_url = None
+                    if generate_image and jpeg_bytes is not None:
+                        image_url = await self._upload_jpeg(
+                            jpeg_bytes,
+                            f"{profile.blob_prefix}/{candidate.id}/ndvi/{uuid.uuid4().hex}.jpg",
+                        )
+                    return PlanetaryNdviImageResponse(
+                        day=candidate.datetime.date(),
+                        cloud_percentual=candidate.cloud_cover_geometry,
+                        image_url=image_url,
+                        ndvi_mean=ndvi_mean,
+                        ndvi_min=ndvi_min,
+                        ndvi_max=ndvi_max,
+                        sat_image_id=candidate.id,
+                    )
+
+            with metrics.span("bands_read"):
+                responses = await asyncio.gather(*(process_day(c) for c in eligible))
+
+            ordered = sorted(responses, key=lambda item: item.day)
+            await self._set_cached_ndvi_range(cache_key, ordered)
+            metrics.log_summary()
+            return Result.Ok(ordered)
+        except AppError as ex:
+            return Result.Err(ex)
+        except ValueError as ex:
+            return Result.Err(str(ex))
+        except Exception as ex:
+            return Result.Err(f"Erro inesperado ao buscar NDVI por range: {str(ex)}")
 
     async def _prepare_context(
         self,
@@ -467,7 +590,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             cloud_percentual,
         )
         if cloud_error is not None:
-            raise ValueError(str(cloud_error))
+            raise cloud_error
 
         return selected, provider, geom, geom_bounds, geometry_cloud_percentual
 
@@ -490,7 +613,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         )
         items = search_result.items
         if not items:
-            raise ValueError("Nenhuma imagem encontrada para a data e geometria fornecidas.")
+            raise BadRequestError("Nenhuma imagem encontrada para a data e geometria fornecidas.")
         items.sort(key=lambda item: item.properties.get("eo:cloud_cover", 100))
         for item in items:
             if item.geometry is None:
@@ -1044,6 +1167,45 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 "ndvi_max": response.ndvi_max,
                 "sat_image_id": response.sat_image_id,
             }
+        )
+        await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
+
+    async def _try_get_cached_ndvi_range(self, key: str) -> list[PlanetaryNdviImageResponse] | None:
+        if self._cache is None:
+            return None
+        raw = await self._cache.get(key)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return [
+            PlanetaryNdviImageResponse(
+                day=date.fromisoformat(item["day"]),
+                cloud_percentual=item["cloud_percentual"],
+                image_url=item.get("image_url"),
+                ndvi_mean=item.get("ndvi_mean"),
+                ndvi_min=item.get("ndvi_min"),
+                ndvi_max=item.get("ndvi_max"),
+                sat_image_id=item["sat_image_id"],
+            )
+            for item in data
+        ]
+
+    async def _set_cached_ndvi_range(self, key: str, responses: list[PlanetaryNdviImageResponse]) -> None:
+        if self._cache is None:
+            return
+        payload = json.dumps(
+            [
+                {
+                    "day": item.day.isoformat(),
+                    "cloud_percentual": item.cloud_percentual,
+                    "image_url": item.image_url,
+                    "ndvi_mean": item.ndvi_mean,
+                    "ndvi_min": item.ndvi_min,
+                    "ndvi_max": item.ndvi_max,
+                    "sat_image_id": item.sat_image_id,
+                }
+                for item in responses
+            ]
         )
         await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
 
