@@ -25,8 +25,8 @@ class GetNdviByRangeServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         service._process_ndvi_from_item = MagicMock(return_value=(None, 0.5, 0.1, 0.9))
         service._upload_jpeg = AsyncMock(return_value="https://blob/ndvi.jpg")
-        service._try_get_cached_ndvi_range = AsyncMock(return_value=None)
-        service._set_cached_ndvi_range = AsyncMock()
+        service._try_get_cached_ndvi = AsyncMock(return_value=None)
+        service._set_cached_ndvi = AsyncMock()
         return service
 
     def _candidate(
@@ -67,6 +67,43 @@ class GetNdviByRangeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload[0].cloud_percentual, 10.0)
         self.assertEqual(payload[1].sat_image_id, "edge-day")
         self.assertEqual(service._process_ndvi_from_item.call_count, 2)
+        self.assertEqual(service._set_cached_ndvi.await_count, 2)
+
+    async def test_reuses_per_day_cache_and_skips_processing(self):
+        candidates = [
+            self._candidate("cached-day", date(2024, 6, 1), 10.0),
+            self._candidate("new-day", date(2024, 6, 2), 8.0),
+        ]
+        service = self._build_service(candidates)
+        service._try_get_cached_ndvi = AsyncMock(
+            side_effect=[
+                PlanetaryNdviImageResponse(
+                    day=date(2024, 6, 1),
+                    cloud_percentual=10.0,
+                    image_url=None,
+                    ndvi_mean=0.7,
+                    ndvi_min=0.2,
+                    ndvi_max=0.8,
+                    sat_image_id="cached-day",
+                ),
+                None,
+            ]
+        )
+
+        result = await service.get_ndvi_by_range(
+            dt_start=datetime(2024, 6, 1),
+            dt_end=datetime(2024, 6, 30),
+            geometry=POLYGON_WKT,
+            cloud_percentual=20.0,
+            generate_image=False,
+        )
+
+        self.assertTrue(result.is_ok())
+        payload = result.value()
+        self.assertEqual(payload[0].ndvi_mean, 0.7)
+        self.assertEqual(payload[1].ndvi_mean, 0.5)
+        self.assertEqual(service._process_ndvi_from_item.call_count, 1)
+        self.assertEqual(service._set_cached_ndvi.await_count, 1)
 
     async def test_returns_not_found_when_no_eligible_days(self):
         candidates = [

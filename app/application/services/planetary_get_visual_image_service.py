@@ -475,20 +475,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
 
         profile = get_sensor_profile(satellite_collection)
         metrics = PerformanceMetrics(context="ndvi_by_range")
-        cache_key = build_cache_key(
-            "ndvi_by_range",
-            dt_start=dt_start,
-            dt_end=dt_end,
-            geometry=geometry,
-            cloud_percentual=cloud_percentual,
-            generate_image=generate_image,
-            preferred_provider=preferred_provider,
-            satellite_collection=satellite_collection,
-            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
-        )
-        cached = await self._try_get_cached_ndvi_range(cache_key)
-        if cached is not None:
-            return Result.Ok(cached)
 
         self._begin_request_scoped_caches()
         try:
@@ -513,6 +499,19 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             semaphore = asyncio.Semaphore(Config.SCL_CONCURRENT_READS)
 
             async def process_day(candidate: "RangeDayCandidate") -> PlanetaryNdviImageResponse:
+                day = candidate.datetime.date()
+                cache_key = self._build_ndvi_range_day_cache_key(
+                    day=day,
+                    geometry=geometry,
+                    sat_image_id=candidate.id,
+                    generate_image=generate_image,
+                    preferred_provider=preferred_provider,
+                    satellite_collection=satellite_collection,
+                )
+                cached = await self._try_get_cached_ndvi(cache_key)
+                if cached is not None:
+                    return cached
+
                 async with semaphore:
                     jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
                         self._process_ndvi_from_item,
@@ -529,8 +528,8 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                             jpeg_bytes,
                             f"{profile.blob_prefix}/{candidate.id}/ndvi/{uuid.uuid4().hex}.jpg",
                         )
-                    return PlanetaryNdviImageResponse(
-                        day=candidate.datetime.date(),
+                    response = PlanetaryNdviImageResponse(
+                        day=day,
                         cloud_percentual=candidate.cloud_cover_geometry,
                         image_url=image_url,
                         ndvi_mean=ndvi_mean,
@@ -538,12 +537,13 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         ndvi_max=ndvi_max,
                         sat_image_id=candidate.id,
                     )
+                    await self._set_cached_ndvi(cache_key, response)
+                    return response
 
             with metrics.span("bands_read"):
                 responses = await asyncio.gather(*(process_day(c) for c in eligible))
 
             ordered = sorted(responses, key=lambda item: item.day)
-            await self._set_cached_ndvi_range(cache_key, ordered)
             metrics.log_summary()
             return Result.Ok(ordered)
         except AppError as ex:
@@ -1112,6 +1112,26 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         )
         return geom, geojson_geom, geom_bounds
 
+    def _build_ndvi_range_day_cache_key(
+        self,
+        day: date,
+        geometry: str,
+        sat_image_id: str,
+        generate_image: bool,
+        preferred_provider: PreferredProvider | None,
+        satellite_collection: SatelliteCollection,
+    ) -> str:
+        return build_cache_key(
+            "ndvi_range_day",
+            day=day,
+            geometry=geometry,
+            sat_image_id=sat_image_id,
+            generate_image=generate_image,
+            preferred_provider=preferred_provider,
+            satellite_collection=satellite_collection,
+            ndvi_stats_version=NDVI_STATS_ALGORITHM_VERSION,
+        )
+
     async def _try_get_cached_visual(self, key: str) -> PlanetaryImageVisualResponse | None:
         if self._cache is None:
             return None
@@ -1167,45 +1187,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 "ndvi_max": response.ndvi_max,
                 "sat_image_id": response.sat_image_id,
             }
-        )
-        await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
-
-    async def _try_get_cached_ndvi_range(self, key: str) -> list[PlanetaryNdviImageResponse] | None:
-        if self._cache is None:
-            return None
-        raw = await self._cache.get(key)
-        if raw is None:
-            return None
-        data = json.loads(raw)
-        return [
-            PlanetaryNdviImageResponse(
-                day=date.fromisoformat(item["day"]),
-                cloud_percentual=item["cloud_percentual"],
-                image_url=item.get("image_url"),
-                ndvi_mean=item.get("ndvi_mean"),
-                ndvi_min=item.get("ndvi_min"),
-                ndvi_max=item.get("ndvi_max"),
-                sat_image_id=item["sat_image_id"],
-            )
-            for item in data
-        ]
-
-    async def _set_cached_ndvi_range(self, key: str, responses: list[PlanetaryNdviImageResponse]) -> None:
-        if self._cache is None:
-            return
-        payload = json.dumps(
-            [
-                {
-                    "day": item.day.isoformat(),
-                    "cloud_percentual": item.cloud_percentual,
-                    "image_url": item.image_url,
-                    "ndvi_mean": item.ndvi_mean,
-                    "ndvi_min": item.ndvi_min,
-                    "ndvi_max": item.ndvi_max,
-                    "sat_image_id": item.sat_image_id,
-                }
-                for item in responses
-            ]
         )
         await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)
 
