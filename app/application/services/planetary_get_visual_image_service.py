@@ -145,7 +145,6 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         self._range_images_service = range_images_service
         self._gdal_config = build_rasterio_gdal_config()
         self._interp_points = Config.IMAGE_POLYGON_INTERP_POINTS
-        self._border_width = Config.IMAGE_POLYGON_BORDER_WIDTH
         self._bounds_margin_ratio = Config.IMAGE_BOUNDS_MARGIN_RATIO
         self._bounds_min_span = Config.IMAGE_BOUNDS_MIN_SPAN
         self._enable_sharpen = Config.IMAGE_ENABLE_SHARPEN
@@ -963,6 +962,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             flat_rgb[mask] = (1 - alpha)[:, None] * cmin + alpha[:, None] * cmax
         return (rgb * 255).astype(np.uint8)
 
+    def _resolve_border_width(self) -> int:
+        return max(1, Config.IMAGE_POLYGON_BORDER_WIDTH)
+
     def _finalize_image_bytes(
         self,
         pil_img: Image.Image,
@@ -971,6 +973,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
     ) -> bytes:
         if self._enable_sharpen:
             pil_img = pil_img.filter(ImageFilter.SHARPEN)
+        pil_img = self._prepare_image_for_report(pil_img)
         pil_img = self._draw_smooth_polygon_on_image(
             pil_img,
             geom,
@@ -978,10 +981,9 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             ctx.transform_affine,
             ctx.window,
             color="white",
-            width=self._border_width,
+            width=self._resolve_border_width(),
             interp_points=self._interp_points,
         )
-        pil_img = self._prepare_image_for_report(pil_img)
         return self._pil_image_to_jpeg_bytes(pil_img)
 
     def _prepare_image_for_report(self, pil_img: Image.Image) -> Image.Image:
