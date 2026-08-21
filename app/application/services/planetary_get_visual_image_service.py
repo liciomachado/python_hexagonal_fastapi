@@ -499,20 +499,20 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             semaphore = asyncio.Semaphore(Config.SCL_CONCURRENT_READS)
 
             async def process_day(candidate: "RangeDayCandidate") -> PlanetaryNdviImageResponse:
-                day = candidate.datetime.date()
-                cache_key = self._build_ndvi_range_day_cache_key(
-                    day=day,
-                    geometry=geometry,
-                    sat_image_id=candidate.id,
-                    generate_image=generate_image,
-                    preferred_provider=preferred_provider,
-                    satellite_collection=satellite_collection,
-                )
-                cached = await self._try_get_cached_ndvi(cache_key)
-                if cached is not None:
-                    return cached
-
                 async with semaphore:
+                    day = candidate.datetime.date()
+                    cache_key = self._build_ndvi_range_day_cache_key(
+                        day=day,
+                        geometry=geometry,
+                        sat_image_id=candidate.id,
+                        generate_image=generate_image,
+                        preferred_provider=preferred_provider,
+                        satellite_collection=satellite_collection,
+                    )
+                    cached = await self._try_get_cached_ndvi(cache_key)
+                    if cached is not None:
+                        return cached
+
                     jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
                         self._process_ndvi_from_item,
                         candidate.stac_item,

@@ -18,6 +18,7 @@ class Config:
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "30"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))
 
     AZURE_BLOB_CONNECTION_STRING = os.getenv("AZURE_BLOB_CONNECTION_STRING", "")
@@ -29,5 +30,5 @@ class Config:
     IMAGE_BOUNDS_MIN_SPAN = float(os.getenv("IMAGE_BOUNDS_MIN_SPAN", "0.001"))
     IMAGE_ENABLE_SHARPEN = os.getenv("IMAGE_ENABLE_SHARPEN", "false").lower() == "true"
     SCL_MAX_DIMENSION = int(os.getenv("SCL_MAX_DIMENSION", "512"))
-    SCL_CONCURRENT_READS = int(os.getenv("SCL_CONCURRENT_READS", "10"))
+    SCL_CONCURRENT_READS = int(os.getenv("SCL_CONCURRENT_READS", "15"))
     VSI_CACHE_SIZE = os.getenv("VSI_CACHE_SIZE", "134217728")

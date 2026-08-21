@@ -2,6 +2,7 @@ import logging
 
 import redis.asyncio as redis
 
+from app.core.config import Config
 from app.domain.ports.cache_port import CachePort
 
 logger = logging.getLogger("app.cache")
@@ -20,6 +21,7 @@ class RedisCacheService(CachePort):
                 self._redis_url,
                 encoding="utf-8",
                 decode_responses=True,
+                max_connections=Config.REDIS_MAX_CONNECTIONS,
             )
 
     async def close(self) -> None:

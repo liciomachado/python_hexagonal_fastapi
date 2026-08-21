@@ -20,6 +20,7 @@ from app.application.services.stac.stac_types import (
 
 class BaseHttpStacProvider(StacProviderPort, ABC):
     TIMEOUT_SECONDS = 30
+    MAX_RANGE_SEARCH_PAGES = 100
 
     def __init__(self, search_url: str, provider_name: StacProviderName):
         self._search_url = search_url
@@ -64,7 +65,7 @@ class BaseHttpStacProvider(StacProviderPort, ABC):
             "datetime": f"{start_date.isoformat()}/{end_date.isoformat()}",
             "limit": limit,
         }
-        features = await self._post_search(payload)
+        features = await self._post_search_paginated(payload)
         return StacSearchResult(
             items=features_to_items(features),
             provider=self._provider_name,
@@ -87,9 +88,41 @@ class BaseHttpStacProvider(StacProviderPort, ABC):
             return False, None, f"Erro de conexão: {exc}"
 
     async def _post_search(self, payload: dict) -> list[dict]:
+        page = await self._request_search_page("POST", self._search_url, payload)
+        return page.get("features", [])
+
+    async def _post_search_paginated(self, payload: dict) -> list[dict]:
+        all_features: list[dict] = []
+        next_request: tuple[str, str, dict | None] | None = ("POST", self._search_url, payload)
+        pages = 0
+
+        while next_request is not None:
+            method, url, body = next_request
+            page = await self._request_search_page(method, url, body)
+            features = page.get("features", [])
+            all_features.extend(features)
+            pages += 1
+
+            next_link = self._extract_next_link(page.get("links", []))
+            if next_link is None or not features or pages >= self.MAX_RANGE_SEARCH_PAGES:
+                break
+
+            next_request = self._build_next_request(next_link)
+
+        return all_features
+
+    async def _request_search_page(
+        self,
+        method: str,
+        url: str,
+        body: dict | None,
+    ) -> dict:
         try:
             client = await get_shared_http_client(timeout=self.TIMEOUT_SECONDS)
-            response = await client.post(self._search_url, json=payload)
+            if method == "POST":
+                response = await client.post(url, json=body)
+            else:
+                response = await client.get(url)
         except httpx.TimeoutException as exc:
             raise StacGatewayTimeoutError(
                 "Timeout ao conectar com a API STAC",
@@ -106,7 +139,20 @@ class BaseHttpStacProvider(StacProviderPort, ABC):
             message = response.text.strip() or f"HTTP {response.status_code}"
             raise StacSearchError(message, status_code=response.status_code, provider=self._provider_name)
 
-        return response.json().get("features", [])
+        return response.json()
+
+    def _extract_next_link(self, links: list[dict]) -> dict | None:
+        for link in links:
+            if link.get("rel") == "next":
+                return link
+        return None
+
+    def _build_next_request(self, link: dict) -> tuple[str, str, dict | None]:
+        method = link.get("method", "GET").upper()
+        href = link.get("href")
+        if not href:
+            raise StacSearchError("Link de paginação STAC inválido: href ausente", provider=self._provider_name)
+        return method, href, link.get("body")
 
     def _ensure_utc(self, value: datetime) -> datetime:
         if value.tzinfo is None:
