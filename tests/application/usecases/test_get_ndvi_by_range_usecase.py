@@ -24,6 +24,10 @@ class GetNdviByRangeUseCaseTests(unittest.IsolatedAsyncioTestCase):
                         ndvi_min=0.1,
                         ndvi_max=0.9,
                         sat_image_id="item-1",
+                        valid_pixels=85,
+                        total_pixels=100,
+                        valid_percentage=85.0,
+                        quality="GOOD",
                     ),
                     PlanetaryNdviImageResponse(
                         day=date(2024, 6, 5),
@@ -33,6 +37,10 @@ class GetNdviByRangeUseCaseTests(unittest.IsolatedAsyncioTestCase):
                         ndvi_min=0.0,
                         ndvi_max=0.8,
                         sat_image_id="item-2",
+                        valid_pixels=40,
+                        total_pixels=100,
+                        valid_percentage=40.0,
+                        quality="LOW_QUALITY",
                     ),
                 ]
             )
@@ -54,7 +62,12 @@ class GetNdviByRangeUseCaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload), 2)
         self.assertEqual(payload[0].ndvi_mean, 0.55)
         self.assertEqual(payload[0].cloud_percentual, 8.5)
+        self.assertEqual(payload[0].valid_pixels, 85)
+        self.assertEqual(payload[0].total_pixels, 100)
+        self.assertEqual(payload[0].valid_percentage, 85.0)
+        self.assertEqual(payload[0].quality, "GOOD")
         self.assertEqual(payload[1].sat_image_id, "item-2")
+        self.assertEqual(payload[1].quality, "LOW_QUALITY")
         service.get_ndvi_by_range.assert_awaited_once()
 
     async def test_execute_propagates_service_error(self):

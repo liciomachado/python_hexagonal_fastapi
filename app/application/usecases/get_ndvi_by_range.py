@@ -61,6 +61,10 @@ class GetNdviByRangeUseCase:
                     ndvi_min=item.ndvi_min,
                     ndvi_max=item.ndvi_max,
                     sat_image_id=item.sat_image_id,
+                    valid_pixels=item.valid_pixels,
+                    total_pixels=item.total_pixels,
+                    valid_percentage=item.valid_percentage,
+                    quality=item.quality,
                 )
                 for item in items
             ]

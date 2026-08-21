@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 import rasterio
@@ -21,8 +21,22 @@ from app.application.services.stac.stac_types import resolve_band_href
 
 SCL_VALID_CLASSES = (4, 5, 6)
 NDVI_DECIMALS = 3
+VALID_PERCENTAGE_DECIMALS = 2
 ZERO_DIVISOR_FIX = np.iinfo(np.uint16).max * 2
 _GDAL_CONFIG = build_rasterio_gdal_config()
+
+
+class NdviStatsResult(NamedTuple):
+    ndvi_mean: float | None
+    ndvi_min: float | None
+    ndvi_max: float | None
+    valid_pixels: int | None
+    total_pixels: int | None
+    valid_percentage: float | None
+    quality: str | None
+
+
+EMPTY_NDVI_STATS = NdviStatsResult(None, None, None, None, None, None, None)
 
 
 def apply_filters(index: np.ndarray) -> np.ndarray:
@@ -85,19 +99,50 @@ def build_valid_pixel_mask(
     return cloud_bits == 0
 
 
+def classify_ndvi_quality(valid_percentage: float) -> str:
+    if valid_percentage >= 80:
+        return "GOOD"
+    if valid_percentage >= 50:
+        return "MODERATE"
+    return "LOW_QUALITY"
+
+
 def aggregate_ndvi_stats(
     ndvi_pixels: np.ndarray,
     valid_mask: np.ndarray,
-) -> tuple[float | None, float | None, float | None]:
+) -> NdviStatsResult:
     rounded = np.round(ndvi_pixels, NDVI_DECIMALS)
-    valid = rounded[
-        ~np.isnan(rounded) & ~np.isinf(rounded) & valid_mask
-    ]
+    finite_and_masked = ~np.isnan(rounded) & ~np.isinf(rounded) & valid_mask
+    valid = rounded[finite_and_masked]
 
-    if valid.size == 0:
-        return None, None, None
+    total_pixels = int(ndvi_pixels.size)
+    valid_pixels = int(valid.size)
+    if total_pixels == 0:
+        return EMPTY_NDVI_STATS
 
-    return float(np.mean(valid)), float(np.min(valid)), float(np.max(valid))
+    valid_percentage = round(valid_pixels / total_pixels * 100, VALID_PERCENTAGE_DECIMALS)
+    quality = classify_ndvi_quality(valid_percentage)
+
+    if valid_pixels == 0:
+        return NdviStatsResult(
+            None,
+            None,
+            None,
+            valid_pixels,
+            total_pixels,
+            valid_percentage,
+            quality,
+        )
+
+    return NdviStatsResult(
+        float(np.mean(valid)),
+        float(np.min(valid)),
+        float(np.max(valid)),
+        valid_pixels,
+        total_pixels,
+        valid_percentage,
+        quality,
+    )
 
 
 def read_polygon_masked_band(href: str, geom: BaseGeometry) -> np.ndarray | None:
@@ -120,13 +165,13 @@ def compute_ndvi_stats_from_bands(
     band_red: np.ndarray,
     band_mask: np.ndarray,
     profile: SensorProfile,
-) -> tuple[float | None, float | None, float | None]:
+) -> NdviStatsResult:
     if band_nir.size == 0 or band_red.size == 0 or band_mask.size == 0:
-        return None, None, None
+        return EMPTY_NDVI_STATS
 
     ndvi_pixels = calc_ndvi(band_nir, band_red)
     if isinstance(ndvi_pixels, list) or ndvi_pixels.size == 0:
-        return None, None, None
+        return EMPTY_NDVI_STATS
 
     valid_mask = build_valid_pixel_mask(band_mask, ndvi_pixels.shape, profile)
     return aggregate_ndvi_stats(ndvi_pixels, valid_mask)
@@ -137,7 +182,7 @@ def compute_legacy_ndvi_stats(
     geom: BaseGeometry,
     profile: SensorProfile,
     sign_url: Callable[[str], str],
-) -> tuple[float | None, float | None, float | None]:
+) -> NdviStatsResult:
     nir_key, red_key = profile.ndvi_bands
     mask_key = profile.cloud_mask_band
 
@@ -154,6 +199,6 @@ def compute_legacy_ndvi_stats(
         band_mask = mask_future.result()
 
     if band_nir is None or band_red is None or band_mask is None:
-        return None, None, None
+        return EMPTY_NDVI_STATS
 
     return compute_ndvi_stats_from_bands(band_nir, band_red, band_mask, profile)

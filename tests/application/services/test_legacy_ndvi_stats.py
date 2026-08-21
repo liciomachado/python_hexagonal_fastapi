@@ -4,10 +4,12 @@ from unittest import mock
 import numpy as np
 
 from app.application.services.legacy_ndvi_stats import (
+    EMPTY_NDVI_STATS,
     SCL_VALID_CLASSES,
     aggregate_ndvi_stats,
     build_valid_pixel_mask,
     calc_ndvi,
+    classify_ndvi_quality,
     compute_legacy_ndvi_stats,
     compute_ndvi_stats_from_bands,
 )
@@ -59,11 +61,38 @@ class LegacyNdviStatsTests(unittest.TestCase):
         ndvi = np.array([0.3334, 0.3336, 0.5000])
         valid_mask = np.array([True, True, True])
 
-        mean, minimum, maximum = aggregate_ndvi_stats(ndvi, valid_mask)
+        stats = aggregate_ndvi_stats(ndvi, valid_mask)
 
-        self.assertAlmostEqual(mean, 0.389, places=3)
-        self.assertAlmostEqual(minimum, 0.333, places=3)
-        self.assertAlmostEqual(maximum, 0.5, places=3)
+        self.assertAlmostEqual(stats.ndvi_mean, 0.389, places=3)
+        self.assertAlmostEqual(stats.ndvi_min, 0.333, places=3)
+        self.assertAlmostEqual(stats.ndvi_max, 0.5, places=3)
+        self.assertEqual(stats.valid_pixels, 3)
+        self.assertEqual(stats.total_pixels, 3)
+        self.assertEqual(stats.valid_percentage, 100.0)
+        self.assertEqual(stats.quality, "GOOD")
+
+    def test_classify_ndvi_quality_thresholds(self):
+        self.assertEqual(classify_ndvi_quality(80.0), "GOOD")
+        self.assertEqual(classify_ndvi_quality(79.9), "MODERATE")
+        self.assertEqual(classify_ndvi_quality(50.0), "MODERATE")
+        self.assertEqual(classify_ndvi_quality(49.9), "LOW_QUALITY")
+
+    def test_aggregate_ndvi_stats_quality_bands(self):
+        ndvi = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+        good = aggregate_ndvi_stats(ndvi, np.array([True, True, True, True]))
+        self.assertEqual(good.valid_percentage, 100.0)
+        self.assertEqual(good.quality, "GOOD")
+
+        moderate = aggregate_ndvi_stats(ndvi, np.array([True, True, False, False]))
+        self.assertEqual(moderate.valid_pixels, 2)
+        self.assertEqual(moderate.total_pixels, 4)
+        self.assertEqual(moderate.valid_percentage, 50.0)
+        self.assertEqual(moderate.quality, "MODERATE")
+
+        low = aggregate_ndvi_stats(ndvi, np.array([True, False, False, False]))
+        self.assertEqual(low.valid_percentage, 25.0)
+        self.assertEqual(low.quality, "LOW_QUALITY")
 
     def test_compute_ndvi_stats_from_bands_matches_pipeline(self):
         nir = np.array([682, 4228, 4228, 682], dtype=np.float32)
@@ -77,6 +106,10 @@ class LegacyNdviStatsTests(unittest.TestCase):
         actual = compute_ndvi_stats_from_bands(nir, red, scl, profile)
 
         self.assertEqual(expected, actual)
+        self.assertEqual(actual.valid_pixels, 2)
+        self.assertEqual(actual.total_pixels, 4)
+        self.assertEqual(actual.valid_percentage, 50.0)
+        self.assertEqual(actual.quality, "MODERATE")
 
     def test_regression_cloudy_pixels_excluded_like_legacy(self):
         """Simula cenário do dia 2026-04-15: nuvens reduzem média sem máscara SCL."""
@@ -89,11 +122,14 @@ class LegacyNdviStatsTests(unittest.TestCase):
         valid_mask = build_valid_pixel_mask(scl, ndvi.shape, profile)
 
         unmasked_mean = float(np.nanmean(ndvi))
-        legacy_mean, _, _ = aggregate_ndvi_stats(ndvi, valid_mask)
+        stats = aggregate_ndvi_stats(ndvi, valid_mask)
 
-        self.assertLess(unmasked_mean, legacy_mean)
+        self.assertLess(unmasked_mean, stats.ndvi_mean)
         self.assertAlmostEqual(unmasked_mean, 0.1391, places=3)
-        self.assertAlmostEqual(legacy_mean, 0.358, places=3)
+        self.assertAlmostEqual(stats.ndvi_mean, 0.358, places=3)
+        self.assertEqual(stats.valid_pixels, 2)
+        self.assertEqual(stats.total_pixels, 4)
+        self.assertEqual(stats.quality, "MODERATE")
 
     def test_compute_legacy_ndvi_stats_reads_bands_in_parallel(self):
         profile = get_sensor_profile(SatelliteCollection.SENTINEL2_L2A)
@@ -137,7 +173,9 @@ class LegacyNdviStatsTests(unittest.TestCase):
         executor_cls.assert_called_once_with(max_workers=3)
         self.assertEqual(mock_executor.submit.call_count, 3)
         self.assertEqual(read_mock.call_count, 3)
-        self.assertIsNotNone(stats[0])
+        self.assertIsNotNone(stats.ndvi_mean)
+        self.assertEqual(stats.valid_pixels, 4)
+        self.assertEqual(stats.quality, "GOOD")
 
     def test_compute_legacy_ndvi_stats_returns_none_when_bands_missing(self):
         profile = get_sensor_profile(SatelliteCollection.SENTINEL2_L2A)
@@ -163,7 +201,7 @@ class LegacyNdviStatsTests(unittest.TestCase):
                 sign_url=lambda href: href,
             )
 
-        self.assertEqual(stats, (None, None, None))
+        self.assertEqual(stats, EMPTY_NDVI_STATS)
 
 
 if __name__ == "__main__":

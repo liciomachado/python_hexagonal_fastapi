@@ -25,7 +25,10 @@ from shapely.ops import transform as shapely_transform
 from app.application.services.dtos.planetary_all_images_response import PlanetaryAllImagesResponse
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
 from app.application.services.dtos.planetary_visual_image_response import PlanetaryImageVisualResponse
-from app.application.services.legacy_ndvi_stats import calc_ndvi, compute_legacy_ndvi_stats
+from app.application.services.legacy_ndvi_stats import (
+    NdviStatsResult,
+    compute_legacy_ndvi_stats,
+)
 from app.application.services.geometry_bounds import compute_cloud_cover_geom_bounds
 from app.application.services.geometry_cloud_cover_service import GeometryCloudCoverService
 from app.application.services.raster_helpers import build_rasterio_gdal_config, compute_out_shape, window_from_bounds
@@ -51,7 +54,7 @@ logger = logging.getLogger("app.image")
 
 REPORT_MAX_IMAGE_DIMENSION = 1200
 REPORT_JPEG_QUALITY = 85
-NDVI_STATS_ALGORITHM_VERSION = "legacy-v1"
+NDVI_STATS_ALGORITHM_VERSION = "legacy-v2"
 
 
 @dataclass
@@ -322,7 +325,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 return Result.Err(BadRequestError(f"Nenhuma imagem cobre ao menos {cloud_percentual}% da geometria."))
 
             with metrics.span("bands_read"):
-                jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
+                jpeg_bytes, ndvi_stats = await asyncio.to_thread(
                     self._process_ndvi_from_item,
                     selected,
                     geom_bounds,
@@ -344,10 +347,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 day=day,
                 cloud_percentual=geometry_cloud_percentual,
                 image_url=image_url,
-                ndvi_mean=ndvi_mean,
-                ndvi_min=ndvi_min,
-                ndvi_max=ndvi_max,
+                ndvi_mean=ndvi_stats.ndvi_mean,
+                ndvi_min=ndvi_stats.ndvi_min,
+                ndvi_max=ndvi_stats.ndvi_max,
                 sat_image_id=selected.id,
+                valid_pixels=ndvi_stats.valid_pixels,
+                total_pixels=ndvi_stats.total_pixels,
+                valid_percentage=ndvi_stats.valid_percentage,
+                quality=ndvi_stats.quality,
             )
             await self._set_cached_ndvi(cache_key, response)
             metrics.log_summary()
@@ -513,7 +520,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                     if cached is not None:
                         return cached
 
-                    jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max = await asyncio.to_thread(
+                    jpeg_bytes, ndvi_stats = await asyncio.to_thread(
                         self._process_ndvi_from_item,
                         candidate.stac_item,
                         geom_bounds,
@@ -532,10 +539,14 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                         day=day,
                         cloud_percentual=candidate.cloud_cover_geometry,
                         image_url=image_url,
-                        ndvi_mean=ndvi_mean,
-                        ndvi_min=ndvi_min,
-                        ndvi_max=ndvi_max,
+                        ndvi_mean=ndvi_stats.ndvi_mean,
+                        ndvi_min=ndvi_stats.ndvi_min,
+                        ndvi_max=ndvi_stats.ndvi_max,
                         sat_image_id=candidate.id,
+                        valid_pixels=ndvi_stats.valid_pixels,
+                        total_pixels=ndvi_stats.total_pixels,
+                        valid_percentage=ndvi_stats.valid_percentage,
+                        quality=ndvi_stats.quality,
                     )
                     await self._set_cached_ndvi(cache_key, response)
                     return response
@@ -629,7 +640,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         geom: BaseGeometry,
         provider: StacProviderName,
         profile: SensorProfile,
-    ) -> tuple[float | None, float | None, float | None]:
+    ) -> NdviStatsResult:
         cache_key = build_cache_key(
             "legacy_ndvi_stats",
             sat_image_id=item.id,
@@ -779,13 +790,11 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         generate_image: bool,
         provider: StacProviderName,
         profile: SensorProfile,
-    ) -> tuple[bytes | None, float | None, float | None, float | None]:
-        ndvi_mean, ndvi_min, ndvi_max = self._compute_legacy_ndvi_stats(
-            item, geom, provider, profile
-        )
+    ) -> tuple[bytes | None, NdviStatsResult]:
+        ndvi_stats = self._compute_legacy_ndvi_stats(item, geom, provider, profile)
 
         if not generate_image:
-            return None, ndvi_mean, ndvi_min, ndvi_max
+            return None, ndvi_stats
 
         nir_key, red_key = profile.ndvi_bands
         bands, ctx = self._read_shared_bands(item, geom_bounds, provider, (red_key, nir_key), profile)
@@ -799,7 +808,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             BANDWIDTH_COLORS_NDVI,
             is_ndvi=True,
         )
-        return jpeg_bytes, ndvi_mean, ndvi_min, ndvi_max
+        return jpeg_bytes, ndvi_stats
 
     def _process_ndmi_from_item(
         self,
@@ -859,9 +868,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
         )
         visual_jpeg = self._finalize_image_bytes(Image.fromarray(image_rgb), geom, ctx)
 
-        ndvi_mean, ndvi_min, ndvi_max = self._compute_legacy_ndvi_stats(
-            item, geom, provider, profile
-        )
+        ndvi_stats = self._compute_legacy_ndvi_stats(item, geom, provider, profile)
         ndvi_jpeg, _, _, _ = self._build_index_product(
             bands[nir_key],
             bands[red_key],
@@ -887,7 +894,7 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             visual_jpeg,
             ndvi_jpeg,
             ndmi_jpeg,
-            (ndvi_mean, ndvi_min, ndvi_max),
+            (ndvi_stats.ndvi_mean, ndvi_stats.ndvi_min, ndvi_stats.ndvi_max),
             (ndmi_mean, ndmi_min, ndmi_max),
         )
 
@@ -1172,6 +1179,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
             ndvi_min=data.get("ndvi_min"),
             ndvi_max=data.get("ndvi_max"),
             sat_image_id=data["sat_image_id"],
+            valid_pixels=data.get("valid_pixels"),
+            total_pixels=data.get("total_pixels"),
+            valid_percentage=data.get("valid_percentage"),
+            quality=data.get("quality"),
         )
 
     async def _set_cached_ndvi(self, key: str, response: PlanetaryNdviImageResponse) -> None:
@@ -1186,6 +1197,10 @@ class PlanetaryVisualImageService(PlanetaryVisualImageServicePort):
                 "ndvi_min": response.ndvi_min,
                 "ndvi_max": response.ndvi_max,
                 "sat_image_id": response.sat_image_id,
+                "valid_pixels": response.valid_pixels,
+                "total_pixels": response.total_pixels,
+                "valid_percentage": response.valid_percentage,
+                "quality": response.quality,
             }
         )
         await self._cache.set(key, payload, ttl_seconds=Config.CACHE_TTL_SECONDS)

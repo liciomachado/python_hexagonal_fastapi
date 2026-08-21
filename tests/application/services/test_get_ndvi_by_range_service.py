@@ -3,6 +3,7 @@ from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from app.application.services.dtos.planetary_ndvi_image_response import PlanetaryNdviImageResponse
+from app.application.services.legacy_ndvi_stats import NdviStatsResult
 from app.application.services.planetary_get_options_by_range import RangeDayCandidate
 from app.application.services.planetary_get_visual_image_service import PlanetaryVisualImageService
 from app.application.services.stac.satellite_collection import SatelliteCollection
@@ -23,7 +24,12 @@ class GetNdviByRangeServiceTests(unittest.IsolatedAsyncioTestCase):
             stac_facade=MagicMock(),
             range_images_service=range_service,
         )
-        service._process_ndvi_from_item = MagicMock(return_value=(None, 0.5, 0.1, 0.9))
+        service._process_ndvi_from_item = MagicMock(
+            return_value=(
+                None,
+                NdviStatsResult(0.5, 0.1, 0.9, 80, 100, 80.0, "GOOD"),
+            )
+        )
         service._upload_jpeg = AsyncMock(return_value="https://blob/ndvi.jpg")
         service._try_get_cached_ndvi = AsyncMock(return_value=None)
         service._set_cached_ndvi = AsyncMock()
@@ -66,6 +72,10 @@ class GetNdviByRangeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.day for item in payload], [date(2024, 6, 1), date(2024, 6, 3)])
         self.assertEqual(payload[0].cloud_percentual, 10.0)
         self.assertEqual(payload[1].sat_image_id, "edge-day")
+        self.assertEqual(payload[0].valid_pixels, 80)
+        self.assertEqual(payload[0].total_pixels, 100)
+        self.assertEqual(payload[0].valid_percentage, 80.0)
+        self.assertEqual(payload[0].quality, "GOOD")
         self.assertEqual(service._process_ndvi_from_item.call_count, 2)
         self.assertEqual(service._set_cached_ndvi.await_count, 2)
 
@@ -85,6 +95,10 @@ class GetNdviByRangeServiceTests(unittest.IsolatedAsyncioTestCase):
                     ndvi_min=0.2,
                     ndvi_max=0.8,
                     sat_image_id="cached-day",
+                    valid_pixels=90,
+                    total_pixels=100,
+                    valid_percentage=90.0,
+                    quality="GOOD",
                 ),
                 None,
             ]
